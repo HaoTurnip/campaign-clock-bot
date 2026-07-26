@@ -1,0 +1,21 @@
+{
+  "name": "campaign-clock-bot",
+  "version": "1.0.0",
+  "description": "2062 — TTRPG campaign clock & daily bulletin Discord bot (Cloudflare Workers + D1)",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "discord-interactions": "^4.1.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "typescript": "^5.7.3",
+    "wrangler": "^3.101.0"
+  }
+}

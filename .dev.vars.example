@@ -1,0 +1,14 @@
+# Copy to `.dev.vars` for local `wrangler dev`, and set the same values in production
+# with `wrangler secret put <NAME>`. Never commit the real `.dev.vars`.
+
+# Bot token from the Discord Developer Portal (Bot tab). Used to post messages.
+DISCORD_TOKEN=
+
+# Application public key (General Information tab). Used to verify interaction signatures.
+DISCORD_PUBLIC_KEY=
+
+# Application ID (General Information tab). Used for command registration.
+DISCORD_APPLICATION_ID=
+
+# A random string you invent. Guards the one-time GET /register?secret=... route.
+REGISTER_SECRET=
