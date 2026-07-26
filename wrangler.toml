@@ -14,7 +14,7 @@ crons = ["* * * * *"]
 [[d1_databases]]
 binding = "DB"
 database_name = "campaign_clock"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+database_id = "3ae25a53-f4e4-431e-9334-df59030dcd04"
 
 # Public, non-secret vars. Secrets (DISCORD_TOKEN, DISCORD_PUBLIC_KEY,
 # DISCORD_APPLICATION_ID, REGISTER_SECRET, and optionally DISCORD_GUILD_ID) are set
@@ -22,4 +22,4 @@ database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
 [vars]
 # DISCORD_GUILD_ID can be set here (non-secret) for fast guild-scoped command
 # registration during development. Leave empty to register commands globally.
-DISCORD_GUILD_ID = ""
+DISCORD_GUILD_ID = "1132359797644210338"
