@@ -55,6 +55,13 @@ interface State {
 }
 
 // ---------------------------------------------------------------------------
+// Small text helpers
+// ---------------------------------------------------------------------------
+
+const p2 = (n: number) => String(n).padStart(2, "0");
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+// ---------------------------------------------------------------------------
 // Time helpers  (in-universe time is a timezone-free UTC epoch)
 // ---------------------------------------------------------------------------
 
@@ -63,8 +70,6 @@ const MONTHS = [
   "January", "February", "March", "April", "May", "June",
   "July", "August", "September", "October", "November", "December",
 ];
-
-const p2 = (n: number) => String(n).padStart(2, "0");
 
 /** Parse "YYYY-MM-DD" or "YYYY-MM-DD HH:MM" (or with a 'T') into epoch ms, or null. */
 function parseDateTime(input: string): number | null {
@@ -117,18 +122,23 @@ const isoTime = (ms: number) => {
   return `${p2(d.getUTCHours())}:${p2(d.getUTCMinutes())}`;
 };
 
-/** "Wednesday, 1 January 2062 ... 08:00" */
-function formatDateTime(ms: number): string {
+/** "08:00" */
+const formatTime = (ms: number) => isoTime(ms);
+
+/** "Monday, 9 January 2062" */
+function formatDate(ms: number): string {
   const d = new Date(ms);
-  return `${WEEKDAYS[d.getUTCDay()]}, ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}` +
-    ` ... ${p2(d.getUTCHours())}:${p2(d.getUTCMinutes())}`;
+  return `${WEEKDAYS[d.getUTCDay()]}, ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
 }
 
-/** "1 January 2062" or "1 January 2062, 14:30" when a time-of-day is present. */
+/** "Monday, 9 January 2062 at 08:00" */
+const formatDateTime = (ms: number) => `${formatDate(ms)} at ${formatTime(ms)}`;
+
+/** "9 January 2062", or "9 January 2062 at 14:30" when a time-of-day is present. */
 function formatAnnDate(ms: number): string {
   const d = new Date(ms);
   const base = `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
-  return d.getUTCHours() || d.getUTCMinutes() ? `${base}, ${isoTime(ms)}` : base;
+  return d.getUTCHours() || d.getUTCMinutes() ? `${base} at ${isoTime(ms)}` : base;
 }
 
 /** Midnight UTC of the in-universe day containing `ms`. */
@@ -240,7 +250,7 @@ async function setState(env: Env, key: string, value: string): Promise<void> {
 /** Announcements reached in the half-open window (oldMs, newMs], chronological. */
 async function windowAnnouncements(env: Env, oldMs: number, newMs: number): Promise<Announcement[]> {
   const { results } = await env.DB
-    .prepare(`SELECT * FROM announcements WHERE at_time > ? AND at_time <= ? ORDER BY at_time ASC`)
+    .prepare(`SELECT * FROM announcements WHERE at_time > ? AND at_time <= ? ORDER BY at_time ASC, id ASC`)
     .bind(oldMs, newMs)
     .all<Announcement>();
   return results;
@@ -279,19 +289,30 @@ async function getGuildRoles(env: Env, guildId: string): Promise<{ id: string; n
 // Bulletin embed
 // ---------------------------------------------------------------------------
 
+function announcementLines(ms: number, anns: Announcement[]): string {
+  return anns
+    .map((a) =>
+      isoDate(a.at_time) === isoDate(ms)
+        ? `- ${a.message}` // same day as the heading; the date would be redundant
+        : `- ${formatAnnDate(a.at_time)}: ${a.message}`,
+    )
+    .join("\n");
+}
+
 function buildBulletin(
   ms: number,
   anns: Announcement[],
-  opts: { title?: string; paused?: boolean } = {},
+  opts: { intro?: string; noneText?: string; paused?: boolean } = {},
 ): object {
-  const lines = anns.length
-    ? anns.map((a) => `- **${formatAnnDate(a.at_time)}** ... ${a.message}`).join("\n")
-    : "_No announcements._";
+  const parts: string[] = [];
+  if (opts.intro) parts.push(opts.intro);
+  parts.push(`The time is ${formatTime(ms)}.`);
+  parts.push(anns.length ? announcementLines(ms, anns) : opts.noneText ?? "There are no announcements today.");
   return {
-    title: opts.title ?? formatDateTime(ms),
-    description: lines,
+    title: formatDate(ms),
+    description: parts.join("\n\n"),
     color: CONFIG.embedColor,
-    footer: { text: `${CONFIG.botName}${opts.paused ? " - clock paused" : ""}` },
+    footer: { text: `${CONFIG.botName}${opts.paused ? " (clock paused)" : ""}` },
   };
 }
 
@@ -348,7 +369,7 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
   if (!PUBLIC_COMMANDS.includes(name)) {
     if (!(await isAuthorized(env, interaction, s.adminRoles))) {
       return reply(
-        `You don't have permission to use /${name}. It requires one of these roles: ` +
+        `You do not have permission to use /${name}. This command is limited to the following roles: ` +
           `${s.adminRoles.join(", ")}.`,
         true,
       );
@@ -359,47 +380,66 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
     case "today": {
       const day = startOfDay(s.currentTime);
       const { results } = await env.DB
-        .prepare(`SELECT * FROM announcements WHERE at_time >= ? AND at_time < ? ORDER BY at_time ASC`)
+        .prepare(`SELECT * FROM announcements WHERE at_time >= ? AND at_time < ? ORDER BY at_time ASC, id ASC`)
         .bind(day, day + 24 * 60 * 60000)
         .all<Announcement>();
-      const lines = results.length
-        ? results.map((a) => `- ${formatAnnDate(a.at_time)} ... ${a.message}`).join("\n")
-        : "_No announcements scheduled for today._";
-      return replyEmbed({
-        title: formatDateTime(s.currentTime),
-        description: lines,
-        color: CONFIG.embedColor,
-        footer: { text: `${CONFIG.botName}${s.paused ? " - clock paused" : ""}` },
-      });
+      return replyEmbed(
+        buildBulletin(s.currentTime, results, {
+          paused: s.paused,
+          noneText: "There are no announcements scheduled for today.",
+        }),
+      );
     }
 
     case "help": {
-      const publicCmds = [
-        "/today ... current in-universe date/time and today's announcements",
-        "/time ... real-world clock status and countdown to the next automatic post",
-        "/help ... this message",
-      ].join("\n");
-      const adminCmds = [
-        "/announce <date> <message> [time] ... schedule an announcement",
-        "/queue ... list pending announcements with their IDs",
-        "/edit <id> [date] [time] [message] ... edit an announcement",
-        "/delete <id> ... delete an announcement",
-        "/pause, /resume ... stop or restart automatic clock advancement",
-        "/settime <datetime> ... set the in-universe clock",
-        "/setposttime <time> [timezone] ... set the daily post time",
-        "/skip <duration> ... advance the clock now, posting a batched bulletin",
-        "/setrate <duration> ... in-universe time added per daily tick",
-        "/flush ... delete expired announcements (dated before today)",
-        "/setchannel [channel] ... set the bulletin channel",
-        "/setroles <names> ... set which roles may use admin commands",
-        "/config ... show current configuration",
-      ].join("\n");
+      const g = (lines: string[]) => lines.join("\n");
       return replyEmbed({
-        title: `${CONFIG.botName} command reference`,
+        title: `${CONFIG.botName} command guide`,
+        description:
+          "Only /today, /time, and /help are open to everyone. Every other command requires an admin role.",
         color: CONFIG.embedColor,
         fields: [
-          { name: "Everyone", value: publicCmds, inline: false },
-          { name: `Admin only (roles: ${s.adminRoles.join(", ")}, or server admins)`, value: adminCmds, inline: false },
+          {
+            name: "Setup",
+            value: g([
+              "/setchannel [channel] - choose where the daily bulletin is posted",
+              "/setposttime <time> [timezone] - set the real-world time it posts each day",
+              "/setrate <duration> - how much in-universe time passes per day",
+              "/setroles <names> - which roles may run admin commands",
+            ]),
+            inline: false,
+          },
+          {
+            name: "The clock",
+            value: g([
+              "/today - the current in-universe date and today's announcements",
+              "/time - real-world status and countdown to the next post",
+              "/settime <datetime> - set the in-universe date and time",
+              "/skip <duration> - move the clock forward now and post a bulletin",
+              "/pause - stop the clock from advancing on its own",
+              "/resume - let the clock advance again",
+            ]),
+            inline: false,
+          },
+          {
+            name: "Announcements",
+            value: g([
+              "/announce <message> [date] [time] - schedule an item (omit the date to post it next time)",
+              "/queue - list scheduled announcements and their IDs",
+              "/edit <id> [message] [date] [time] - change an announcement",
+              "/delete <id> - remove an announcement",
+              "/flush - clear announcements whose date has already passed",
+            ]),
+            inline: false,
+          },
+          {
+            name: "Other",
+            value: g([
+              "/config - show the current settings at a glance",
+              "/help - show this guide",
+            ]),
+            inline: false,
+          },
         ],
       }, true);
     }
@@ -407,19 +447,18 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
     case "time": {
       const now = Date.now();
       const { date, time } = tzParts(now, s.postTz);
-      const next = nextPostAt(now, s);
-      const diff = next - now;
-      const when = diff < 60000 ? "within a minute" : `in ${humanDuration(diff)}`;
+      const diff = nextPostAt(now, s) - now;
+      const when = diff < 60000 ? "in under a minute" : `in ${humanDuration(diff)}`;
       return replyEmbed({
-        title: `${CONFIG.botName} clock status`,
+        title: `${CONFIG.botName} status`,
         description: s.channelId
           ? undefined
-          : "No bulletin channel is set, so no automatic post will happen yet. Run /setchannel.",
+          : "No bulletin channel is set yet, so nothing will post automatically. Run /setchannel to fix this.",
         color: CONFIG.embedColor,
         fields: [
           { name: "Real-world time", value: `${date} ${time} (${s.postTz})`, inline: false },
-          { name: "Daily post time", value: `${s.postTime} (${s.postTz})`, inline: true },
-          { name: "Next automatic post", value: when, inline: true },
+          { name: "Posts daily at", value: `${s.postTime} (${s.postTz})`, inline: true },
+          { name: "Next bulletin", value: s.channelId ? when : "not scheduled", inline: true },
           {
             name: "In-universe clock",
             value: `${formatDateTime(s.currentTime)}${s.paused ? " (paused)" : ""}`,
@@ -430,145 +469,180 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
     }
 
     case "announce": {
-      const dateStr = String(opt(interaction, "date"));
       const message = String(opt(interaction, "message"));
-      const timeStr = opt(interaction, "time");
-      const at = parseDateTime(timeStr ? `${dateStr} ${timeStr}` : dateStr);
-      if (at == null) return reply("Invalid date/time. Use YYYY-MM-DD for the date and HH:MM for the time.", true);
+      const dateStr = opt(interaction, "date") as string | undefined;
+      const timeStr = opt(interaction, "time") as string | undefined;
+
+      let at: number;
+      if (dateStr === undefined) {
+        // No date given: schedule it just after the current clock so the next
+        // advancement (daily post or /skip) sweeps it into the very next bulletin.
+        at = s.currentTime + 1;
+      } else {
+        const parsed = parseDateTime(timeStr ? `${dateStr} ${timeStr}` : dateStr);
+        if (parsed == null) {
+          return reply("That date or time is not valid. Use YYYY-MM-DD for the date and HH:MM for the time.", true);
+        }
+        at = parsed;
+      }
+
       const row = await env.DB
         .prepare(`INSERT INTO announcements (at_time, message, created_at) VALUES (?, ?, ?) RETURNING id`)
         .bind(at, message, Date.now())
         .first<{ id: number }>();
-      return reply(`Announcement #${row!.id} scheduled for ${formatAnnDate(at)}.`, true);
+      return reply(
+        dateStr === undefined
+          ? `Saved announcement #${row!.id}. It will appear in the next bulletin.`
+          : `Saved announcement #${row!.id}, scheduled for ${formatAnnDate(at)}.`,
+        true,
+      );
     }
 
     case "queue": {
       const from = startOfDay(s.currentTime);
       const { results } = await env.DB
-        .prepare(`SELECT * FROM announcements WHERE at_time >= ? ORDER BY at_time ASC`)
+        .prepare(`SELECT * FROM announcements WHERE at_time >= ? ORDER BY at_time ASC, id ASC`)
         .bind(from)
         .all<Announcement>();
-      if (!results.length) return reply("No pending announcements.", true);
-      const lines = results.map((a) => `#${a.id} ... ${formatAnnDate(a.at_time)}\n${a.message}`).join("\n\n");
-      return replyEmbed({ title: "Pending announcements", description: lines, color: CONFIG.embedColor }, true);
+      if (!results.length) return reply("There are no scheduled announcements.", true);
+      const lines = results
+        .map((a) => `#${a.id}, ${formatAnnDate(a.at_time)}\n${a.message}`)
+        .join("\n\n");
+      return replyEmbed({ title: "Scheduled announcements", description: lines, color: CONFIG.embedColor }, true);
     }
 
     case "edit": {
       const id = Number(opt(interaction, "id"));
+      const message = opt(interaction, "message") as string | undefined;
       const dateStr = opt(interaction, "date") as string | undefined;
       const timeStr = opt(interaction, "time") as string | undefined;
-      const message = opt(interaction, "message") as string | undefined;
-      if (dateStr === undefined && timeStr === undefined && message === undefined) {
-        return reply("Provide at least one field to change (date, time, or message).", true);
+      if (message === undefined && dateStr === undefined && timeStr === undefined) {
+        return reply("Give at least one thing to change: a message, a date, or a time.", true);
       }
       const existing = await env.DB.prepare(`SELECT * FROM announcements WHERE id = ?`).bind(id).first<Announcement>();
-      if (!existing) return reply(`No announcement with ID #${id}.`, true);
+      if (!existing) return reply(`There is no announcement with the ID #${id}.`, true);
 
       let at = existing.at_time;
       if (dateStr !== undefined || timeStr !== undefined) {
         const datePart = dateStr ?? isoDate(existing.at_time);
         const timePart = timeStr ?? isoTime(existing.at_time);
         const parsed = parseDateTime(`${datePart} ${timePart}`);
-        if (parsed == null) return reply("Invalid date/time.", true);
+        if (parsed == null) return reply("That date or time is not valid.", true);
         at = parsed;
       }
       const newMessage = message ?? existing.message;
       await env.DB.prepare(`UPDATE announcements SET at_time = ?, message = ? WHERE id = ?`).bind(at, newMessage, id).run();
-      return reply(`Announcement #${id} updated: ${formatAnnDate(at)} ... ${newMessage}`, true);
+      return reply(`Updated announcement #${id}. It is now set for ${formatAnnDate(at)}.`, true);
     }
 
     case "delete": {
       const id = Number(opt(interaction, "id"));
       const res = await env.DB.prepare(`DELETE FROM announcements WHERE id = ?`).bind(id).run();
-      if (!res.meta.changes) return reply(`No announcement with ID #${id}.`, true);
+      if (!res.meta.changes) return reply(`There is no announcement with the ID #${id}.`, true);
       return reply(`Deleted announcement #${id}.`, true);
     }
 
     case "pause": {
       await setState(env, "paused", "1");
-      return reply("Automatic clock advancement is now paused. Daily bulletins still post, but the date won't move.", true);
+      return reply(
+        "The clock is now paused. The daily bulletin will still post, but the in-universe date will not move until you resume.",
+        true,
+      );
     }
 
     case "resume": {
       await setState(env, "paused", "0");
-      return reply("Automatic clock advancement resumed.", true);
+      return reply("The clock will now advance again on its daily schedule.", true);
     }
 
     case "settime": {
       const dt = parseDateTime(String(opt(interaction, "datetime")));
-      if (dt == null) return reply("Invalid datetime. Use YYYY-MM-DD or YYYY-MM-DD HH:MM.", true);
+      if (dt == null) return reply("That datetime is not valid. Use YYYY-MM-DD or YYYY-MM-DD HH:MM.", true);
       await setState(env, "current_time", String(dt));
-      return reply(`In-universe clock set to ${formatDateTime(dt)}.`, true);
+      return reply(`The in-universe clock is now set to ${formatDateTime(dt)}.`, true);
     }
 
     case "setposttime": {
       const time = String(opt(interaction, "time"));
-      if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) return reply("Invalid time. Use 24-hour HH:MM.", true);
+      if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) return reply("That time is not valid. Use a 24-hour HH:MM.", true);
       const tz = opt(interaction, "timezone") as string | undefined;
       if (tz !== undefined) {
-        if (!isValidTz(tz)) return reply(`Unknown timezone ${tz}. Use an IANA name like Europe/London.`, true);
+        if (!isValidTz(tz)) return reply(`That timezone is not recognised. Use an IANA name such as Europe/London.`, true);
         await setState(env, "post_tz", tz);
       }
       await setState(env, "post_time", time);
-      // Re-arm today's post so a freshly set time can fire again the same day (handy for testing).
+      // Clear today's post marker so a freshly set time can fire again today (handy for testing).
       await setState(env, "last_post_date", "");
-      return reply(`Daily bulletin will post at ${time} (${tz ?? s.postTz}). Today's post has been re-armed.`, true);
+      return reply(
+        `The daily bulletin will now post at ${time} (${tz ?? s.postTz}). Today's bulletin is ready to fire again at that time.`,
+        true,
+      );
     }
 
     case "skip": {
       const dur = parseDuration(String(opt(interaction, "duration")));
-      if (dur == null) return reply("Invalid duration. Use e.g. 3d, 6h, 90m, 1d6h.", true);
+      if (dur == null) return reply("That duration is not valid. Try something like 3d, 6h, 90m, or 1d6h.", true);
       const oldMs = s.currentTime;
       const newMs = oldMs + dur;
       const reached = await windowAnnouncements(env, oldMs, newMs);
       await setState(env, "current_time", String(newMs));
       const embed = buildBulletin(newMs, reached, {
-        title: `Time advances ${humanDuration(dur)} to ${formatDateTime(newMs)}`,
+        intro: `The clock has advanced by ${humanDuration(dur)}.`,
+        noneText: "No announcements fell within the skipped period.",
+        paused: s.paused,
       });
       if (s.channelId) {
         await postMessage(env, s.channelId, { embeds: [embed] });
-        return reply(`Advanced to ${formatDateTime(newMs)} and posted ${reached.length} announcement(s) to the bulletin channel.`, true);
+        return reply(
+          `Advanced the clock by ${humanDuration(dur)} to ${formatDateTime(newMs)}. ` +
+            `Posted the bulletin with ${plural(reached.length, "announcement")} to the channel.`,
+          true,
+        );
       }
       return replyEmbed(embed);
     }
 
     case "setrate": {
       const dur = parseDuration(String(opt(interaction, "duration")));
-      if (dur == null) return reply("Invalid duration. Use e.g. 1d, 12h, 1d6h.", true);
+      if (dur == null) return reply("That duration is not valid. Try something like 1d, 12h, or 1d6h.", true);
       await setState(env, "advance_rate", String(dur));
-      return reply(`The clock will now advance ${humanDuration(dur)} per daily tick.`, true);
+      return reply(`The clock will now advance by ${humanDuration(dur)} each day.`, true);
     }
 
     case "flush": {
       const before = startOfDay(s.currentTime);
       const res = await env.DB.prepare(`DELETE FROM announcements WHERE at_time < ?`).bind(before).run();
-      return reply(`Flushed ${res.meta.changes} expired announcement(s) (dated before today).`, true);
+      const n = res.meta.changes ?? 0;
+      return reply(
+        n ? `Cleared ${plural(n, "past announcement")} from before today.` : "There were no past announcements to clear.",
+        true,
+      );
     }
 
     case "setchannel": {
       const channelId = (opt(interaction, "channel") as string | undefined) ?? interaction.channel_id;
-      if (!channelId) return reply("Could not determine a channel.", true);
+      if (!channelId) return reply("I could not work out which channel you mean.", true);
       await setState(env, "channel_id", channelId);
-      return reply(`Daily bulletins will be posted to <#${channelId}>.`, true);
+      return reply(`The daily bulletin will now be posted in <#${channelId}>.`, true);
     }
 
     case "setroles": {
       const raw = String(opt(interaction, "roles"));
       const names = raw.split(/[,\s]+/).map((r) => r.trim()).filter(Boolean);
-      if (!names.length) return reply("Provide at least one role name.", true);
+      if (!names.length) return reply("Give at least one role name.", true);
       await setState(env, "admin_roles", JSON.stringify(names));
-      return reply(`Authorized admin roles updated: ${names.join(", ")}.`, true);
+      return reply(`Admin commands are now limited to these roles: ${names.join(", ")}.`, true);
     }
 
     case "config": {
       return replyEmbed({
-        title: `${CONFIG.botName} configuration`,
+        title: `${CONFIG.botName} settings`,
         color: CONFIG.embedColor,
         fields: [
           { name: "In-universe clock", value: formatDateTime(s.currentTime), inline: false },
-          { name: "Advancement", value: s.paused ? "paused" : `${humanDuration(s.advanceRate)} / day`, inline: true },
-          { name: "Daily post time", value: `${s.postTime} (${s.postTz})`, inline: true },
-          { name: "Bulletin channel", value: s.channelId ? `<#${s.channelId}>` : "_not set_", inline: true },
+          { name: "Advancement", value: s.paused ? "paused" : `${humanDuration(s.advanceRate)} per day`, inline: true },
+          { name: "Posts daily at", value: `${s.postTime} (${s.postTz})`, inline: true },
+          { name: "Bulletin channel", value: s.channelId ? `<#${s.channelId}>` : "not set", inline: true },
           { name: "Admin roles", value: s.adminRoles.join(", "), inline: false },
         ],
       }, true);
@@ -590,21 +664,21 @@ const COMMANDS = [
   { name: "help", description: "Show the list of commands and what they do." },
   { name: "time", description: "Show real-world clock status and countdown to the next automatic post." },
   {
-    name: "announce", description: "Schedule an announcement for an in-universe date.",
+    name: "announce", description: "Schedule a bulletin announcement.",
     options: [
-      { name: "date", description: "In-universe date (YYYY-MM-DD)", type: STRING, required: true },
       { name: "message", description: "The announcement text", type: STRING, required: true },
-      { name: "time", description: "Time of day (HH:MM, optional)", type: STRING, required: false },
+      { name: "date", description: "In-universe date YYYY-MM-DD (omit to post it next bulletin)", type: STRING, required: false },
+      { name: "time", description: "Time of day HH:MM (optional)", type: STRING, required: false },
     ],
   },
-  { name: "queue", description: "List all pending announcements with their IDs." },
+  { name: "queue", description: "List all scheduled announcements with their IDs." },
   {
     name: "edit", description: "Edit an announcement by ID.",
     options: [
       { name: "id", description: "Announcement ID", type: INTEGER, required: true },
+      { name: "message", description: "New message text", type: STRING, required: false },
       { name: "date", description: "New date (YYYY-MM-DD)", type: STRING, required: false },
       { name: "time", description: "New time (HH:MM)", type: STRING, required: false },
-      { name: "message", description: "New message text", type: STRING, required: false },
     ],
   },
   {
@@ -632,7 +706,7 @@ const COMMANDS = [
     name: "setrate", description: "Set how much in-universe time passes per daily tick.",
     options: [{ name: "duration", description: "e.g. 1d, 12h, 1d6h", type: STRING, required: true }],
   },
-  { name: "flush", description: "Delete expired announcements (dated before today)." },
+  { name: "flush", description: "Delete past announcements (dated before today)." },
   {
     name: "setchannel", description: "Set the channel for automatic daily bulletins.",
     options: [{ name: "channel", description: "Target channel (defaults to this one)", type: CHANNEL, required: false }],
