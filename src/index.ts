@@ -488,14 +488,14 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
 
       const num = (n: number) => n.toLocaleString("en-US");
       const desc = [
-        `Roll margin: ${Math.round(margin)}`,
-        `Hit strength: ${multiplier.toFixed(2)} times normal`,
+        `Margin: ${Math.round(margin)}`,
+        `Effectiveness: ${multiplier.toFixed(2)}x`,
         `Cohesion damage: ${damage.toFixed(1)}`,
-        "",
-        `Defender cohesion: ${cohesion.toFixed(1)} down to ${newCohesion.toFixed(1)} (a drop of ${(lossPercent * 100).toFixed(1)} percent)`,
-        `Armour absorbed ${(casualtyReduction * 100).toFixed(0)} percent of the losses`,
-        `Casualties: ${num(casualties)} men`,
-        `Men remaining: ${num(remaining)}`,
+        `Cohesion: ${cohesion.toFixed(1)} to ${newCohesion.toFixed(1)}`,
+        `Cohesion lost: ${(lossPercent * 100).toFixed(1)}%`,
+        `Casualty reduction: ${(casualtyReduction * 100).toFixed(0)}%`,
+        `Casualties: ${num(casualties)}`,
+        `Remaining men: ${num(remaining)}`,
       ].join("\n");
       return replyEmbed({ title: "Attack result", description: desc, color: CONFIG.embedColor });
     }
@@ -698,12 +698,12 @@ const COMMANDS = [
   {
     name: "attack", description: "Work out cohesion damage and casualties from an attack.",
     options: [
-      { name: "assault_roll", description: "Attacker's roll", type: NUMBER, required: true },
-      { name: "weaponry", description: "Attacker's weaponry", type: NUMBER, required: true },
-      { name: "deflection_roll", description: "Defender's roll", type: NUMBER, required: true },
-      { name: "protection", description: "Defender's protection", type: NUMBER, required: true },
-      { name: "cohesion", description: "Defender's current cohesion (0-100)", type: NUMBER, required: true },
-      { name: "men", description: "Defender's current number of men", type: INTEGER, required: true },
+      { name: "assault_roll", description: "attacker roll", type: NUMBER, required: true },
+      { name: "weaponry", description: "weaponry", type: NUMBER, required: true },
+      { name: "deflection_roll", description: "defender roll", type: NUMBER, required: true },
+      { name: "protection", description: "protection", type: NUMBER, required: true },
+      { name: "cohesion", description: "cohesion 0-100", type: NUMBER, required: true },
+      { name: "men", description: "men", type: INTEGER, required: true },
     ],
   },
   {
