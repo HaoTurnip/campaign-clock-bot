@@ -356,7 +356,7 @@ async function isAuthorized(env: Env, interaction: Interaction, adminRoles: stri
 }
 
 // Commands anyone may use; everything else is role-gated.
-const PUBLIC_COMMANDS = ["today", "help", "time"];
+const PUBLIC_COMMANDS = ["today", "help", "time", "attack"];
 
 // ---------------------------------------------------------------------------
 // Command handlers
@@ -396,7 +396,7 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
       return replyEmbed({
         title: `${CONFIG.botName} command guide`,
         description:
-          "Only /today, /time, and /help are open to everyone. Every other command requires an admin role.",
+          "Only /today, /time, /help, and /attack are open to everyone. Every other command requires an admin role.",
         color: CONFIG.embedColor,
         fields: [
           {
@@ -435,6 +435,7 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
           {
             name: "Other",
             value: g([
+              "/attack - work out cohesion damage and casualties from an attack",
               "/config - show the current settings at a glance",
               "/help - show this guide",
             ]),
@@ -466,6 +467,37 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
           },
         ],
       }, true);
+    }
+
+    case "attack": {
+      const assault = Number(opt(interaction, "assault_roll"));
+      const weaponry = Number(opt(interaction, "weaponry"));
+      const deflection = Number(opt(interaction, "deflection_roll"));
+      const protection = Number(opt(interaction, "protection"));
+      const cohesion = Number(opt(interaction, "cohesion"));
+      const men = Math.trunc(Number(opt(interaction, "men")));
+
+      const margin = assault - deflection;
+      const multiplier = 1 + margin / 100;
+      const damage = weaponry * multiplier;
+      const newCohesion = Math.max(0, cohesion - damage);
+      const lossPercent = (cohesion - newCohesion) / 100;
+      const casualtyReduction = weaponry + protection > 0 ? protection / (weaponry + protection) : 0;
+      const casualties = Math.max(0, Math.round(men * lossPercent * (1 - casualtyReduction)));
+      const remaining = Math.max(0, men - casualties);
+
+      const num = (n: number) => n.toLocaleString("en-US");
+      const desc = [
+        `Roll margin: ${Math.round(margin)}`,
+        `Hit strength: ${multiplier.toFixed(2)} times normal`,
+        `Cohesion damage: ${damage.toFixed(1)}`,
+        "",
+        `Defender cohesion: ${cohesion.toFixed(1)} down to ${newCohesion.toFixed(1)} (a drop of ${(lossPercent * 100).toFixed(1)} percent)`,
+        `Armour absorbed ${(casualtyReduction * 100).toFixed(0)} percent of the losses`,
+        `Casualties: ${num(casualties)} men`,
+        `Men remaining: ${num(remaining)}`,
+      ].join("\n");
+      return replyEmbed({ title: "Attack result", description: desc, color: CONFIG.embedColor });
     }
 
     case "announce": {
@@ -657,12 +689,23 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
 // Slash-command definitions & registration
 // ---------------------------------------------------------------------------
 
-const STRING = 3, INTEGER = 4, CHANNEL = 7;
+const STRING = 3, INTEGER = 4, CHANNEL = 7, NUMBER = 10;
 
 const COMMANDS = [
   { name: "today", description: "Show the current in-universe date/time and today's announcements." },
   { name: "help", description: "Show the list of commands and what they do." },
   { name: "time", description: "Show real-world clock status and countdown to the next automatic post." },
+  {
+    name: "attack", description: "Work out cohesion damage and casualties from an attack.",
+    options: [
+      { name: "assault_roll", description: "Attacker's roll", type: NUMBER, required: true },
+      { name: "weaponry", description: "Attacker's weaponry", type: NUMBER, required: true },
+      { name: "deflection_roll", description: "Defender's roll", type: NUMBER, required: true },
+      { name: "protection", description: "Defender's protection", type: NUMBER, required: true },
+      { name: "cohesion", description: "Defender's current cohesion (0-100)", type: NUMBER, required: true },
+      { name: "men", description: "Defender's current number of men", type: INTEGER, required: true },
+    ],
+  },
   {
     name: "announce", description: "Schedule a bulletin announcement.",
     options: [
