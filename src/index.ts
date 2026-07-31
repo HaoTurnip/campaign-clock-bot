@@ -52,6 +52,7 @@ interface State {
   channelId: string;
   adminRoles: string[];
   lastPostDate: string;
+  inboxUserId: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +216,7 @@ async function ensureSchema(env: Env): Promise<void> {
     ["channel_id", ""],
     ["admin_roles", JSON.stringify(d.adminRoles)],
     ["last_post_date", ""],
+    ["inbox_user_id", ""],
   ];
   await env.DB.batch(
     seed.map(([k, v]) =>
@@ -237,6 +239,7 @@ async function loadState(env: Env): Promise<State> {
     channelId: m.get("channel_id") ?? "",
     adminRoles: JSON.parse(m.get("admin_roles") ?? JSON.stringify(d.adminRoles)),
     lastPostDate: m.get("last_post_date") ?? "",
+    inboxUserId: m.get("inbox_user_id") ?? "",
   };
 }
 
@@ -335,7 +338,8 @@ interface Interaction {
   type: number;
   guild_id?: string;
   channel_id?: string;
-  member?: { permissions?: string; roles?: string[]; user?: { id: string } };
+  member?: { permissions?: string; roles?: string[]; user?: { id: string; username?: string } };
+  user?: { id: string; username?: string };
   data: {
     name?: string;
     options?: { name: string; value: string | number }[];
@@ -382,12 +386,41 @@ function openMsgModal(userId: string): Response {
   });
 }
 
-/** Open a DM channel with a user and send them `content`. */
-async function sendDm(env: Env, userId: string, content: string): Promise<Response> {
+/** A single "Reply" button row to attach to an outgoing DM. */
+function replyButton(): unknown[] {
+  return [{ type: 1, components: [{ type: 2, style: 1, label: "Reply", custom_id: "reply" }] }];
+}
+
+/** The popup a recipient sees after pressing "Reply". */
+function openReplyModal(): Response {
+  return json({
+    type: 9, // MODAL
+    data: {
+      custom_id: "reply",
+      title: "Reply",
+      components: [
+        {
+          type: 1,
+          components: [
+            { type: 4, custom_id: "body", label: "Your reply", style: 2, required: true, max_length: 2000 },
+          ],
+        },
+      ],
+    },
+  });
+}
+
+/** Open a DM channel with a user and send them `payload`. Returns success. */
+async function dmUser(env: Env, userId: string, payload: unknown): Promise<boolean> {
   const dmRes = await discord(env, "POST", "/users/@me/channels", { recipient_id: userId });
-  if (!dmRes.ok) return reply(`Could not open a DM with <@${userId}>.`, true);
+  if (!dmRes.ok) return false;
   const dm = (await dmRes.json()) as { id: string };
-  const sent = await postMessage(env, dm.id, { content });
+  return postMessage(env, dm.id, payload);
+}
+
+/** DM a member a message with a Reply button, and report the outcome to the sender. */
+async function sendDm(env: Env, userId: string, content: string): Promise<Response> {
+  const sent = await dmUser(env, userId, { content, components: replyButton() });
   return reply(
     sent
       ? `Message sent to <@${userId}>.`
@@ -444,6 +477,7 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
               "/setposttime <time> [timezone] - set the real-world time it posts each day",
               "/setrate <duration> - how much in-universe time passes per day",
               "/setroles <names> - which roles may run admin commands",
+              "/setinbox <user> - who receives replies to the bot's DMs",
             ]),
             inline: false,
           },
@@ -709,6 +743,12 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
       // Always open the multi-line popup; the message is typed there.
       return openMsgModal(String(opt(interaction, "user")));
 
+    case "setinbox": {
+      const userId = String(opt(interaction, "user"));
+      await setState(env, "inbox_user_id", userId);
+      return reply(`Replies to the bot's DMs will now be forwarded to <@${userId}>.`, true);
+    }
+
     case "config": {
       return replyEmbed({
         title: `${CONFIG.botName} settings`,
@@ -718,6 +758,7 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
           { name: "Advancement", value: s.paused ? "paused" : `${humanDuration(s.advanceRate)} per day`, inline: true },
           { name: "Posts daily at", value: `${s.postTime} (${s.postTz})`, inline: true },
           { name: "Bulletin channel", value: s.channelId ? `<#${s.channelId}>` : "not set", inline: true },
+          { name: "Reply inbox", value: s.inboxUserId ? `<@${s.inboxUserId}>` : "not set", inline: true },
           { name: "Admin roles", value: s.adminRoles.join(", "), inline: false },
         ],
       }, true);
@@ -728,18 +769,39 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
   }
 }
 
+function modalBody(interaction: Interaction): string {
+  return interaction.data.components?.[0]?.components?.[0]?.value ?? "";
+}
+
 async function handleModal(interaction: Interaction, env: Env): Promise<Response> {
   const cid = interaction.data.custom_id ?? "";
+
+  // A member replying to one of the bot's DMs.
+  if (cid === "reply") {
+    const s = await loadState(env);
+    const replier = interaction.member?.user ?? interaction.user;
+    if (s.inboxUserId && replier) {
+      const header = `Reply from ${replier.username ?? "a member"} (<@${replier.id}>):`;
+      await dmUser(env, s.inboxUserId, { content: `${header}\n${modalBody(interaction)}` });
+    }
+    return reply("Your reply has been sent.", true);
+  }
+
+  // An admin sending a DM through /msg.
   if (cid.startsWith("msg:")) {
     const s = await loadState(env);
     if (!(await isAuthorized(env, interaction, s.adminRoles))) {
       return reply("You do not have permission to use /msg.", true);
     }
-    const userId = cid.slice(4);
-    const body = interaction.data.components?.[0]?.components?.[0]?.value ?? "";
-    return sendDm(env, userId, body);
+    return sendDm(env, cid.slice(4), modalBody(interaction));
   }
+
   return reply("Unknown submission.", true);
+}
+
+async function handleComponent(interaction: Interaction): Promise<Response> {
+  if ((interaction.data.custom_id ?? "") === "reply") return openReplyModal();
+  return json({ type: 6 }); // acknowledge with no visible change
 }
 
 // ---------------------------------------------------------------------------
@@ -815,6 +877,10 @@ const COMMANDS = [
     name: "setroles", description: "Configure which role names may use admin commands.",
     options: [{ name: "roles", description: "Comma/space separated role names", type: STRING, required: true }],
   },
+  {
+    name: "setinbox", description: "Choose who receives replies to the bot's DMs.",
+    options: [{ name: "user", description: "member", type: USER, required: true }],
+  },
   { name: "config", description: "Show the current bot configuration and clock state." },
   {
     name: "msg", description: "Send a direct message to a server member.",
@@ -869,6 +935,9 @@ export default {
     if (interaction.type === 2) {
       await ensureSchema(env);
       return handleCommand(interaction, env);
+    }
+    if (interaction.type === 3) { // MESSAGE_COMPONENT (button press)
+      return handleComponent(interaction);
     }
     if (interaction.type === 5) { // MODAL_SUBMIT
       await ensureSchema(env);
