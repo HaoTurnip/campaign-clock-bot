@@ -386,17 +386,21 @@ function openMsgModal(userId: string): Response {
   });
 }
 
-/** A single "Reply" button row to attach to an outgoing DM. */
-function replyButton(): unknown[] {
-  return [{ type: 1, components: [{ type: 2, style: 1, label: "Reply", custom_id: "reply" }] }];
+/**
+ * A "Reply" button row. With a target user id the reply is delivered straight to
+ * that user; with no target it is routed to the configured inbox.
+ */
+function replyButtonTo(userId?: string): unknown[] {
+  const custom_id = userId ? `reply:${userId}` : "reply";
+  return [{ type: 1, components: [{ type: 2, style: 1, label: "Reply", custom_id }] }];
 }
 
-/** The popup a recipient sees after pressing "Reply". */
-function openReplyModal(): Response {
+/** The popup a member sees after pressing a Reply button; carries the button's custom_id through. */
+function openReplyModal(customId: string): Response {
   return json({
     type: 9, // MODAL
     data: {
-      custom_id: "reply",
+      custom_id: customId,
       title: "Reply",
       components: [
         {
@@ -420,7 +424,7 @@ async function dmUser(env: Env, userId: string, payload: unknown): Promise<boole
 
 /** DM a member a message with a Reply button, and report the outcome to the sender. */
 async function sendDm(env: Env, userId: string, content: string): Promise<Response> {
-  const sent = await dmUser(env, userId, { content, components: replyButton() });
+  const sent = await dmUser(env, userId, { content, components: replyButtonTo() });
   return reply(
     sent
       ? `Message sent to <@${userId}>.`
@@ -776,13 +780,23 @@ function modalBody(interaction: Interaction): string {
 async function handleModal(interaction: Interaction, env: Env): Promise<Response> {
   const cid = interaction.data.custom_id ?? "";
 
-  // A member replying to one of the bot's DMs.
-  if (cid === "reply") {
+  // A member using a Reply button. "reply:<id>" is delivered straight to that
+  // user; plain "reply" is routed to the configured inbox.
+  if (cid === "reply" || cid.startsWith("reply:")) {
     const s = await loadState(env);
     const replier = interaction.member?.user ?? interaction.user;
+    const body = modalBody(interaction);
+
+    if (cid.startsWith("reply:")) {
+      // The replied-to member can reply back to the inbox from their copy.
+      const ok = await dmUser(env, cid.slice(6), { content: body, components: replyButtonTo() });
+      return reply(ok ? "Your reply has been sent." : "That person could not be messaged.", true);
+    }
+
     if (s.inboxUserId && replier) {
+      // Forward to the inbox with a button that replies straight back to this member.
       const header = `Reply from ${replier.username ?? "a member"} (<@${replier.id}>):`;
-      await dmUser(env, s.inboxUserId, { content: `${header}\n${modalBody(interaction)}` });
+      await dmUser(env, s.inboxUserId, { content: `${header}\n${body}`, components: replyButtonTo(replier.id) });
     }
     return reply("Your reply has been sent.", true);
   }
@@ -800,7 +814,8 @@ async function handleModal(interaction: Interaction, env: Env): Promise<Response
 }
 
 async function handleComponent(interaction: Interaction): Promise<Response> {
-  if ((interaction.data.custom_id ?? "") === "reply") return openReplyModal();
+  const cid = interaction.data.custom_id ?? "";
+  if (cid === "reply" || cid.startsWith("reply:")) return openReplyModal(cid);
   return json({ type: 6 }); // acknowledge with no visible change
 }
 
