@@ -436,6 +436,7 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
             name: "Other",
             value: g([
               "/attack - work out cohesion damage and casualties from an attack",
+              "/msg <user> <message> - send a direct message to a member",
               "/config - show the current settings at a glance",
               "/help - show this guide",
             ]),
@@ -666,6 +667,21 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
       return reply(`Admin commands are now limited to these roles: ${names.join(", ")}.`, true);
     }
 
+    case "msg": {
+      const userId = String(opt(interaction, "user"));
+      const message = String(opt(interaction, "message"));
+      const dmRes = await discord(env, "POST", "/users/@me/channels", { recipient_id: userId });
+      if (!dmRes.ok) return reply(`Could not open a DM with <@${userId}>.`, true);
+      const dm = (await dmRes.json()) as { id: string };
+      const sent = await postMessage(env, dm.id, { content: message });
+      return reply(
+        sent
+          ? `Message sent to <@${userId}>.`
+          : `Could not message <@${userId}>. They may have DMs from server members turned off.`,
+        true,
+      );
+    }
+
     case "config": {
       return replyEmbed({
         title: `${CONFIG.botName} settings`,
@@ -689,7 +705,7 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
 // Slash-command definitions & registration
 // ---------------------------------------------------------------------------
 
-const STRING = 3, INTEGER = 4, CHANNEL = 7, NUMBER = 10;
+const STRING = 3, INTEGER = 4, USER = 6, CHANNEL = 7, NUMBER = 10;
 
 const COMMANDS = [
   { name: "today", description: "Show the current in-universe date/time and today's announcements." },
@@ -759,6 +775,13 @@ const COMMANDS = [
     options: [{ name: "roles", description: "Comma/space separated role names", type: STRING, required: true }],
   },
   { name: "config", description: "Show the current bot configuration and clock state." },
+  {
+    name: "msg", description: "Send a direct message to a server member.",
+    options: [
+      { name: "user", description: "member", type: USER, required: true },
+      { name: "message", description: "message", type: STRING, required: true },
+    ],
+  },
 ];
 
 async function registerCommands(env: Env): Promise<Response> {
