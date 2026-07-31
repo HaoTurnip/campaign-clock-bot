@@ -336,7 +336,12 @@ interface Interaction {
   guild_id?: string;
   channel_id?: string;
   member?: { permissions?: string; roles?: string[]; user?: { id: string } };
-  data: { name: string; options?: { name: string; value: string | number }[] };
+  data: {
+    name?: string;
+    options?: { name: string; value: string | number }[];
+    custom_id?: string;
+    components?: { components: { custom_id: string; value: string }[] }[];
+  };
 }
 
 function opt(interaction: Interaction, name: string): string | number | undefined {
@@ -358,12 +363,45 @@ async function isAuthorized(env: Env, interaction: Interaction, adminRoles: stri
 // Commands anyone may use; everything else is role-gated.
 const PUBLIC_COMMANDS = ["today", "help", "time", "attack"];
 
+/** A popup with a multi-line paragraph box, so DM bodies can contain newlines. */
+function openMsgModal(userId: string): Response {
+  return json({
+    type: 9, // MODAL
+    data: {
+      custom_id: `msg:${userId}`,
+      title: "Send a message",
+      components: [
+        {
+          type: 1,
+          components: [
+            { type: 4, custom_id: "body", label: "Message", style: 2, required: true, max_length: 2000 },
+          ],
+        },
+      ],
+    },
+  });
+}
+
+/** Open a DM channel with a user and send them `content`. */
+async function sendDm(env: Env, userId: string, content: string): Promise<Response> {
+  const dmRes = await discord(env, "POST", "/users/@me/channels", { recipient_id: userId });
+  if (!dmRes.ok) return reply(`Could not open a DM with <@${userId}>.`, true);
+  const dm = (await dmRes.json()) as { id: string };
+  const sent = await postMessage(env, dm.id, { content });
+  return reply(
+    sent
+      ? `Message sent to <@${userId}>.`
+      : `Could not message <@${userId}>. They may have DMs from server members turned off.`,
+    true,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Command handlers
 // ---------------------------------------------------------------------------
 
 async function handleCommand(interaction: Interaction, env: Env): Promise<Response> {
-  const name = interaction.data.name;
+  const name = interaction.data.name ?? "";
   const s = await loadState(env);
 
   if (!PUBLIC_COMMANDS.includes(name)) {
@@ -669,17 +707,11 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
 
     case "msg": {
       const userId = String(opt(interaction, "user"));
-      const message = String(opt(interaction, "message"));
-      const dmRes = await discord(env, "POST", "/users/@me/channels", { recipient_id: userId });
-      if (!dmRes.ok) return reply(`Could not open a DM with <@${userId}>.`, true);
-      const dm = (await dmRes.json()) as { id: string };
-      const sent = await postMessage(env, dm.id, { content: message });
-      return reply(
-        sent
-          ? `Message sent to <@${userId}>.`
-          : `Could not message <@${userId}>. They may have DMs from server members turned off.`,
-        true,
-      );
+      const message = opt(interaction, "message") as string | undefined;
+      // No inline message: open a multi-line popup. Otherwise send it, turning
+      // any literal \n into real line breaks.
+      if (message === undefined) return openMsgModal(userId);
+      return sendDm(env, userId, message.replace(/\\n/g, "\n"));
     }
 
     case "config": {
@@ -699,6 +731,20 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
     default:
       return reply("Unknown command.", true);
   }
+}
+
+async function handleModal(interaction: Interaction, env: Env): Promise<Response> {
+  const cid = interaction.data.custom_id ?? "";
+  if (cid.startsWith("msg:")) {
+    const s = await loadState(env);
+    if (!(await isAuthorized(env, interaction, s.adminRoles))) {
+      return reply("You do not have permission to use /msg.", true);
+    }
+    const userId = cid.slice(4);
+    const body = interaction.data.components?.[0]?.components?.[0]?.value ?? "";
+    return sendDm(env, userId, body);
+  }
+  return reply("Unknown submission.", true);
 }
 
 // ---------------------------------------------------------------------------
@@ -779,7 +825,7 @@ const COMMANDS = [
     name: "msg", description: "Send a direct message to a server member.",
     options: [
       { name: "user", description: "member", type: USER, required: true },
-      { name: "message", description: "message", type: STRING, required: true },
+      { name: "message", description: "message (leave blank for a multi-line box)", type: STRING, required: false },
     ],
   },
 ];
@@ -829,6 +875,10 @@ export default {
     if (interaction.type === 2) {
       await ensureSchema(env);
       return handleCommand(interaction, env);
+    }
+    if (interaction.type === 5) { // MODAL_SUBMIT
+      await ensureSchema(env);
+      return handleModal(interaction, env);
     }
     return json({ type: 1 });
   },
