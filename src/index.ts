@@ -48,7 +48,7 @@ interface State {
   paused: boolean;
   postTime: string;
   postTz: string;
-  advanceRate: number; // ms
+  advanceRate: Dur;
   channelId: string;
   adminRoles: string[];
   lastPostDate: string;
@@ -85,28 +85,67 @@ function parseDateTime(input: string): number | null {
   return ms;
 }
 
-/** Parse a duration like "3d", "6h", "90m", "1d6h", "2w" into ms, or null. */
-function parseDuration(input: string): number | null {
-  const cleaned = String(input).trim().toLowerCase();
-  if (!/^(\d+\s*[wdhm]\s*)+$/.test(cleaned)) return null;
-  const re = /(\d+)\s*([wdhm])/g;
-  let total = 0, m: RegExpExecArray | null;
-  while ((m = re.exec(cleaned))) {
-    const n = parseInt(m[1], 10);
-    const unit = m[2];
-    const minutes = unit === "w" ? 7 * 24 * 60 : unit === "d" ? 24 * 60 : unit === "h" ? 60 : 1;
-    total += n * minutes * 60000;
-  }
-  return total > 0 ? total : null;
+/**
+ * A duration split into whole calendar months (variable length) and a fixed
+ * millisecond remainder. Months are applied by the calendar; the rest is exact.
+ */
+interface Dur {
+  months: number;
+  ms: number;
 }
 
-/** ms -> "1w 2d 6h 30m" */
-function humanDuration(ms: number): string {
-  let mins = Math.floor(ms / 60000);
+/** Parse a duration like "3d", "6h", "90m", "1d6h", "2w", "1mo", "1y", "1mo 15d". */
+function parseDuration(input: string): Dur | null {
+  const cleaned = String(input).trim().toLowerCase();
+  // Note: "mo" must be listed before "m" so months are not read as minutes.
+  if (!/^(\d+\s*(mo|y|w|d|h|m)\s*)+$/.test(cleaned)) return null;
+  const re = /(\d+)\s*(mo|y|w|d|h|m)/g;
+  let months = 0, ms = 0, m: RegExpExecArray | null, matched = false;
+  while ((m = re.exec(cleaned))) {
+    matched = true;
+    const n = parseInt(m[1], 10);
+    switch (m[2]) {
+      case "y": months += n * 12; break;
+      case "mo": months += n; break;
+      case "w": ms += n * 7 * 24 * 60 * 60000; break;
+      case "d": ms += n * 24 * 60 * 60000; break;
+      case "h": ms += n * 60 * 60000; break;
+      case "m": ms += n * 60000; break;
+    }
+  }
+  if (!matched || (months === 0 && ms === 0)) return null;
+  return { months, ms };
+}
+
+/**
+ * Add a duration to an epoch. Whole months move to the same day-of-month, clamped
+ * to the last day when it overflows (e.g. 31 Jan + 1mo -> 28/29 Feb); the fixed
+ * millisecond part is then added exactly.
+ */
+function applyDuration(baseMs: number, dur: Dur): number {
+  let ms = baseMs;
+  if (dur.months) {
+    const d = new Date(baseMs);
+    const total = d.getUTCFullYear() * 12 + d.getUTCMonth() + dur.months;
+    const year = Math.floor(total / 12);
+    const month = ((total % 12) + 12) % 12;
+    const lastDay = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+    const day = Math.min(d.getUTCDate(), lastDay);
+    ms = Date.UTC(year, month, day, d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds(), d.getUTCMilliseconds());
+  }
+  return ms + dur.ms;
+}
+
+/** Dur -> "1y 2mo 3w 4d 5h 6m" */
+function humanDuration(dur: Dur): string {
+  const parts: string[] = [];
+  const y = Math.floor(dur.months / 12), mo = dur.months % 12;
+  if (y) parts.push(`${y}y`);
+  if (mo) parts.push(`${mo}mo`);
+  let mins = Math.floor(dur.ms / 60000);
   const w = Math.floor(mins / (7 * 24 * 60)); mins -= w * 7 * 24 * 60;
   const d = Math.floor(mins / (24 * 60)); mins -= d * 24 * 60;
   const h = Math.floor(mins / 60); const m = mins % 60;
-  const parts: string[] = [];
   if (w) parts.push(`${w}w`);
   if (d) parts.push(`${d}d`);
   if (h) parts.push(`${h}h`);
@@ -212,7 +251,7 @@ async function ensureSchema(env: Env): Promise<void> {
     ["paused", "0"],
     ["post_time", d.postTime],
     ["post_tz", d.postTz],
-    ["advance_rate", String(parseDuration(d.advanceRate))],
+    ["advance_rate", JSON.stringify(parseDuration(d.advanceRate))],
     ["channel_id", ""],
     ["admin_roles", JSON.stringify(d.adminRoles)],
     ["last_post_date", ""],
@@ -226,6 +265,20 @@ async function ensureSchema(env: Env): Promise<void> {
   schemaReady = true;
 }
 
+/** Read a stored advance rate, tolerating the old plain-number (ms) format. */
+function parseRate(raw: string | undefined): Dur {
+  if (raw) {
+    try {
+      const v = JSON.parse(raw);
+      if (typeof v === "number") return { months: 0, ms: v }; // legacy value
+      if (v && typeof v.ms === "number") return { months: v.months ?? 0, ms: v.ms };
+    } catch {
+      /* fall through to default */
+    }
+  }
+  return parseDuration(CONFIG.defaults.advanceRate)!;
+}
+
 async function loadState(env: Env): Promise<State> {
   const { results } = await env.DB.prepare(`SELECT key, value FROM config`).all<{ key: string; value: string }>();
   const m = new Map(results.map((r) => [r.key, r.value]));
@@ -235,7 +288,7 @@ async function loadState(env: Env): Promise<State> {
     paused: (m.get("paused") ?? "0") === "1",
     postTime: m.get("post_time") ?? d.postTime,
     postTz: m.get("post_tz") ?? d.postTz,
-    advanceRate: Number(m.get("advance_rate") ?? parseDuration(d.advanceRate)),
+    advanceRate: parseRate(m.get("advance_rate")),
     channelId: m.get("channel_id") ?? "",
     adminRoles: JSON.parse(m.get("admin_roles") ?? JSON.stringify(d.adminRoles)),
     lastPostDate: m.get("last_post_date") ?? "",
@@ -526,7 +579,7 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
       const now = Date.now();
       const { date, time } = tzParts(now, s.postTz);
       const diff = nextPostAt(now, s) - now;
-      const when = diff < 60000 ? "in under a minute" : `in ${humanDuration(diff)}`;
+      const when = diff < 60000 ? "in under a minute" : `in ${humanDuration({ months: 0, ms: diff })}`;
       return replyEmbed({
         title: `${CONFIG.botName} status`,
         description: s.channelId
@@ -690,9 +743,9 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
 
     case "skip": {
       const dur = parseDuration(String(opt(interaction, "duration")));
-      if (dur == null) return reply("That duration is not valid. Try something like 3d, 6h, 90m, or 1d6h.", true);
+      if (dur == null) return reply("That duration is not valid. Try something like 3d, 6h, 90m, 1mo, or 1d6h.", true);
       const oldMs = s.currentTime;
-      const newMs = oldMs + dur;
+      const newMs = applyDuration(oldMs, dur);
       const reached = await windowAnnouncements(env, oldMs, newMs);
       await setState(env, "current_time", String(newMs));
       const embed = buildBulletin(newMs, reached, {
@@ -713,8 +766,8 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
 
     case "setrate": {
       const dur = parseDuration(String(opt(interaction, "duration")));
-      if (dur == null) return reply("That duration is not valid. Try something like 1d, 12h, or 1d6h.", true);
-      await setState(env, "advance_rate", String(dur));
+      if (dur == null) return reply("That duration is not valid. Try something like 1mo, 1d, 12h, or 1mo 15d.", true);
+      await setState(env, "advance_rate", JSON.stringify(dur));
       return reply(`The clock will now advance by ${humanDuration(dur)} each day.`, true);
     }
 
@@ -877,11 +930,11 @@ const COMMANDS = [
   },
   {
     name: "skip", description: "Advance the clock now, batching any announcements crossed.",
-    options: [{ name: "duration", description: "e.g. 3d, 6h, 90m, 1d6h", type: STRING, required: true }],
+    options: [{ name: "duration", description: "e.g. 3d, 6h, 90m, 1mo, 1d6h", type: STRING, required: true }],
   },
   {
     name: "setrate", description: "Set how much in-universe time passes per daily tick.",
-    options: [{ name: "duration", description: "e.g. 1d, 12h, 1d6h", type: STRING, required: true }],
+    options: [{ name: "duration", description: "e.g. 1d, 12h, 1mo, 1mo 15d", type: STRING, required: true }],
   },
   { name: "flush", description: "Delete past announcements (dated before today)." },
   {
@@ -972,7 +1025,7 @@ export default {
     if (time < s.postTime) return; // configured post time not reached yet
 
     const oldMs = s.currentTime;
-    const newMs = s.paused ? oldMs : oldMs + s.advanceRate;
+    const newMs = s.paused ? oldMs : applyDuration(oldMs, s.advanceRate);
     const reached = s.paused ? [] : await windowAnnouncements(env, oldMs, newMs);
 
     if (!s.paused) await setState(env, "current_time", String(newMs));
