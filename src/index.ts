@@ -474,7 +474,7 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
             name: "Other",
             value: g([
               "/attack - work out cohesion damage and casualties from an attack",
-              "/msg <user> <message> - send a direct message to a member",
+              "/msg <user> - send a direct message to a member",
               "/config - show the current settings at a glance",
               "/help - show this guide",
             ]),
@@ -705,14 +705,9 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
       return reply(`Admin commands are now limited to these roles: ${names.join(", ")}.`, true);
     }
 
-    case "msg": {
-      const userId = String(opt(interaction, "user"));
-      const message = opt(interaction, "message") as string | undefined;
-      // No inline message: open a multi-line popup. Otherwise send it, turning
-      // any literal \n into real line breaks.
-      if (message === undefined) return openMsgModal(userId);
-      return sendDm(env, userId, message.replace(/\\n/g, "\n"));
-    }
+    case "msg":
+      // Always open the multi-line popup; the message is typed there.
+      return openMsgModal(String(opt(interaction, "user")));
 
     case "config": {
       return replyEmbed({
@@ -825,7 +820,6 @@ const COMMANDS = [
     name: "msg", description: "Send a direct message to a server member.",
     options: [
       { name: "user", description: "member", type: USER, required: true },
-      { name: "message", description: "message (leave blank for a multi-line box)", type: STRING, required: false },
     ],
   },
 ];
