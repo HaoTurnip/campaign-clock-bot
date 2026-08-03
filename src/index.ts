@@ -243,6 +243,39 @@ async function ensureSchema(env: Env): Promise<void> {
       )`,
     ),
     env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_ann_time ON announcements(at_time)`),
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS battles (name TEXT PRIMARY KEY COLLATE NOCASE, created_at INTEGER NOT NULL)`),
+    env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS armies (
+        battle TEXT NOT NULL COLLATE NOCASE,
+        name TEXT NOT NULL COLLATE NOCASE,
+        weaponry REAL NOT NULL,
+        protection REAL NOT NULL,
+        attacker_mod REAL NOT NULL,
+        defender_mod REAL NOT NULL,
+        men INTEGER NOT NULL,
+        cohesion REAL NOT NULL,
+        PRIMARY KEY (battle, name)
+      )`,
+    ),
+    env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS pending_attacks (
+        id TEXT PRIMARY KEY,
+        battle TEXT NOT NULL COLLATE NOCASE,
+        attacker TEXT NOT NULL COLLATE NOCASE,
+        defender TEXT NOT NULL COLLATE NOCASE,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )`,
+    ),
+    env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS last_attack (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        battle TEXT NOT NULL,
+        defender TEXT NOT NULL,
+        before_men INTEGER NOT NULL,
+        before_cohesion REAL NOT NULL
+      )`,
+    ),
   ]);
 
   const d = CONFIG.defaults;
@@ -395,7 +428,7 @@ interface Interaction {
   user?: { id: string; username?: string };
   data: {
     name?: string;
-    options?: { name: string; value: string | number }[];
+    options?: { name: string; value: string | number; focused?: boolean }[];
     custom_id?: string;
     components?: { components: { custom_id: string; value: string }[] }[];
   };
@@ -418,7 +451,7 @@ async function isAuthorized(env: Env, interaction: Interaction, adminRoles: stri
 }
 
 // Commands anyone may use; everything else is role-gated.
-const PUBLIC_COMMANDS = ["today", "help", "time", "attack"];
+const PUBLIC_COMMANDS = ["today", "help", "time"];
 
 /** A popup with a multi-line paragraph box, so DM bodies can contain newlines. */
 function openMsgModal(userId: string): Response {
@@ -487,6 +520,155 @@ async function sendDm(env: Env, userId: string, content: string): Promise<Respon
 }
 
 // ---------------------------------------------------------------------------
+// Battle system
+// ---------------------------------------------------------------------------
+
+interface Army {
+  battle: string;
+  name: string;
+  weaponry: number;
+  protection: number;
+  attacker_mod: number;
+  defender_mod: number;
+  men: number;
+  cohesion: number;
+}
+
+interface AttackResult {
+  aRoll: number; dRoll: number; aTotal: number; dTotal: number;
+  margin: number; multiplier: number; damage: number;
+  cohBefore: number; cohAfter: number; menBefore: number; menAfter: number;
+  casualties: number; reduction: number;
+}
+
+const numFmt = (n: number) => n.toLocaleString("en-US");
+const signFmt = (n: number) => (n >= 0 ? `+ ${n}` : `- ${Math.abs(n)}`);
+
+async function getBattle(env: Env, name: string): Promise<{ name: string } | null> {
+  return env.DB.prepare(`SELECT name FROM battles WHERE name = ?`).bind(name).first<{ name: string }>();
+}
+
+async function getArmy(env: Env, battle: string, name: string): Promise<Army | null> {
+  return env.DB.prepare(`SELECT * FROM armies WHERE battle = ? AND name = ?`).bind(battle, name).first<Army>();
+}
+
+/** Roll both d100s, apply modifiers, and work out damage/casualties. */
+function computeAttack(atk: Army, def: Army): AttackResult {
+  const d100 = () => Math.floor(Math.random() * 100) + 1;
+  const aRoll = d100(), dRoll = d100();
+  const aTotal = aRoll + atk.attacker_mod;
+  const dTotal = dRoll + def.defender_mod;
+  const margin = aTotal - dTotal;
+  const multiplier = 1 + margin / 100;
+  const damage = Math.floor(atk.weaponry * multiplier * (atk.men / 200));
+  const cohAfter = Math.max(0, def.cohesion - damage);
+  const lossPercent = (def.cohesion - cohAfter) / 100;
+  const reduction = atk.weaponry + def.protection > 0 ? def.protection / (atk.weaponry + def.protection) : 0;
+  const casualties = Math.max(0, Math.round(def.men * lossPercent * (1 - reduction)));
+  return {
+    aRoll, dRoll, aTotal, dTotal, margin, multiplier, damage,
+    cohBefore: def.cohesion, cohAfter, menBefore: def.men, menAfter: Math.max(0, def.men - casualties),
+    casualties, reduction,
+  };
+}
+
+function attackBody(atk: Army, def: Army, r: AttackResult): string {
+  return [
+    `${atk.name} attacks ${def.name}`,
+    `Attacker roll: ${r.aRoll} ${signFmt(atk.attacker_mod)} = ${r.aTotal}`,
+    `Defender roll: ${r.dRoll} ${signFmt(def.defender_mod)} = ${r.dTotal}`,
+    `Margin: ${r.margin}`,
+    `Effectiveness: ${r.multiplier.toFixed(2)}x`,
+    `Cohesion damage: ${r.damage}`,
+    `${def.name} cohesion: ${r.cohBefore.toFixed(1)} to ${r.cohAfter.toFixed(1)}`,
+    `Casualty reduction: ${(r.reduction * 100).toFixed(0)}%`,
+    `Casualties: ${numFmt(r.casualties)}`,
+    `${def.name} men: ${numFmt(r.menBefore)} to ${numFmt(r.menAfter)}`,
+  ].join("\n");
+}
+
+interface PendingPayload {
+  battle: string; attacker: string; defender: string;
+  menBefore: number; cohBefore: number; menAfter: number; cohAfter: number; body: string;
+}
+
+/** Edit the message a button is attached to (used to close out a preview). */
+function updateMessage(content: string): Response {
+  return json({ type: 7, data: { content, embeds: [], components: [] } });
+}
+
+async function confirmAttack(env: Env, interaction: Interaction, id: string): Promise<Response> {
+  const s = await loadState(env);
+  if (!(await isAuthorized(env, interaction, s.adminRoles))) {
+    return reply("You do not have permission to confirm attacks.", true);
+  }
+  const row = await env.DB.prepare(`SELECT payload FROM pending_attacks WHERE id = ?`).bind(id).first<{ payload: string }>();
+  if (!row) return updateMessage("This attack preview is no longer valid.");
+  const p = JSON.parse(row.payload) as PendingPayload;
+
+  const def = await getArmy(env, p.battle, p.defender);
+  if (!def) {
+    await env.DB.prepare(`DELETE FROM pending_attacks WHERE id = ?`).bind(id).run();
+    return updateMessage("The defending army no longer exists. Cancelled.");
+  }
+  // Guard against stale previews: the defender must be unchanged since the roll.
+  if (def.men !== p.menBefore || def.cohesion !== p.cohBefore) {
+    await env.DB.prepare(`DELETE FROM pending_attacks WHERE id = ?`).bind(id).run();
+    return updateMessage("The defender's state changed since this preview. Run the attack again.");
+  }
+  // Save the undo point, apply, and clear this plus any sibling previews on the same defender.
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO last_attack (id, battle, defender, before_men, before_cohesion) VALUES (1, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET battle = excluded.battle, defender = excluded.defender,
+       before_men = excluded.before_men, before_cohesion = excluded.before_cohesion`,
+    ).bind(p.battle, p.defender, def.men, def.cohesion),
+    env.DB.prepare(`UPDATE armies SET men = ?, cohesion = ? WHERE battle = ? AND name = ?`)
+      .bind(p.menAfter, p.cohAfter, p.battle, p.defender),
+    env.DB.prepare(`DELETE FROM pending_attacks WHERE battle = ? AND defender = ?`).bind(p.battle, p.defender),
+  ]);
+
+  if (interaction.channel_id) {
+    await postMessage(env, interaction.channel_id, {
+      embeds: [{ title: `Attack in ${p.battle}`, description: p.body, color: CONFIG.embedColor }],
+    });
+  }
+  return updateMessage("Attack confirmed and applied.");
+}
+
+async function cancelAttack(env: Env, interaction: Interaction, id: string): Promise<Response> {
+  const s = await loadState(env);
+  if (!(await isAuthorized(env, interaction, s.adminRoles))) {
+    return reply("You do not have permission.", true);
+  }
+  await env.DB.prepare(`DELETE FROM pending_attacks WHERE id = ?`).bind(id).run();
+  return updateMessage("Attack cancelled. Nothing was changed.");
+}
+
+/** Autocomplete battle and army names as the GM types. */
+async function handleAutocomplete(interaction: Interaction, env: Env): Promise<Response> {
+  const opts = interaction.data.options ?? [];
+  const focused = opts.find((o) => o.focused);
+  const q = String(focused?.value ?? "").toLowerCase();
+  let names: string[] = [];
+  if (focused?.name === "battle") {
+    const { results } = await env.DB.prepare(`SELECT name FROM battles ORDER BY created_at ASC`).all<{ name: string }>();
+    names = results.map((r) => r.name);
+  } else if (["army", "attacker", "defender"].includes(focused?.name ?? "")) {
+    const battle = opts.find((o) => o.name === "battle")?.value;
+    if (battle !== undefined) {
+      const { results } = await env.DB
+        .prepare(`SELECT name FROM armies WHERE battle = ? ORDER BY name ASC`)
+        .bind(String(battle).trim())
+        .all<{ name: string }>();
+      names = results.map((r) => r.name);
+    }
+  }
+  const choices = names.filter((n) => n.toLowerCase().includes(q)).slice(0, 25).map((n) => ({ name: n, value: n }));
+  return json({ type: 8, data: { choices } });
+}
+
+// ---------------------------------------------------------------------------
 // Command handlers
 // ---------------------------------------------------------------------------
 
@@ -524,7 +706,7 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
       return replyEmbed({
         title: `${CONFIG.botName} command guide`,
         description:
-          "Only /today, /time, /help, and /attack are open to everyone. Every other command requires an admin role.",
+          "Only /today, /time, and /help are open to everyone. Every other command requires an admin role.",
         color: CONFIG.embedColor,
         fields: [
           {
@@ -562,9 +744,23 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
             inline: false,
           },
           {
+            name: "Battles",
+            value: g([
+              "/start_battle <name> - begin a battle",
+              "/register_army <battle> <army> <stats> - add an army",
+              "/edit_army <battle> <army> [stats] - change an army's stats",
+              "/unregister_army <battle> <army> - remove an army",
+              "/battle_status <battle> - list armies and their current state",
+              "/list_battles - list active battles",
+              "/attack <battle> <attacker> <defender> - roll an attack, then confirm",
+              "/undo_attack - revert the last confirmed attack",
+              "/end_battle <name> - end a battle and clear its armies",
+            ]),
+            inline: false,
+          },
+          {
             name: "Other",
             value: g([
-              "/attack - work out cohesion damage and casualties from an attack",
               "/msg <user> - send a direct message to a member",
               "/config - show the current settings at a glance",
               "/help - show this guide",
@@ -599,46 +795,167 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
       }, true);
     }
 
-    case "attack": {
-      const attackerMod = Number(opt(interaction, "attacker_mod"));
+    case "start_battle": {
+      const battleName = String(opt(interaction, "name")).trim();
+      if (!battleName) return reply("Give the battle a name.", true);
+      if (await getBattle(env, battleName)) return reply(`A battle named ${battleName} already exists.`, true);
+      await env.DB.prepare(`INSERT INTO battles (name, created_at) VALUES (?, ?)`).bind(battleName, Date.now()).run();
+      return reply(`Battle ${battleName} started. Add armies with /register_army.`, true);
+    }
+
+    case "end_battle": {
+      const battleName = String(opt(interaction, "name")).trim();
+      if (!(await getBattle(env, battleName))) return reply(`There is no battle named ${battleName}.`, true);
+      await env.DB.batch([
+        env.DB.prepare(`DELETE FROM armies WHERE battle = ?`).bind(battleName),
+        env.DB.prepare(`DELETE FROM pending_attacks WHERE battle = ?`).bind(battleName),
+        env.DB.prepare(`DELETE FROM last_attack WHERE battle = ?`).bind(battleName),
+        env.DB.prepare(`DELETE FROM battles WHERE name = ?`).bind(battleName),
+      ]);
+      return reply(`Battle ${battleName} ended and all its armies were cleared.`, true);
+    }
+
+    case "list_battles": {
+      const { results } = await env.DB.prepare(
+        `SELECT b.name AS name, COUNT(a.name) AS armies FROM battles b
+         LEFT JOIN armies a ON a.battle = b.name GROUP BY b.name ORDER BY b.created_at ASC`,
+      ).all<{ name: string; armies: number }>();
+      if (!results.length) return reply("There are no active battles.", true);
+      const lines = results
+        .map((b) => `- ${b.name} (${b.armies} ${b.armies === 1 ? "army" : "armies"})`)
+        .join("\n");
+      return replyEmbed({ title: "Active battles", description: lines, color: CONFIG.embedColor }, true);
+    }
+
+    case "battle_status": {
+      const battle = String(opt(interaction, "battle")).trim();
+      if (!(await getBattle(env, battle))) return reply(`There is no battle named ${battle}.`, true);
+      const { results } = await env.DB.prepare(`SELECT * FROM armies WHERE battle = ? ORDER BY name ASC`).bind(battle).all<Army>();
+      if (!results.length) {
+        return replyEmbed({ title: `Battle: ${battle}`, description: "No armies registered yet.", color: CONFIG.embedColor }, true);
+      }
+      const lines = results.map((a) => {
+        const am = a.attacker_mod >= 0 ? `+${a.attacker_mod}` : `${a.attacker_mod}`;
+        const dm = a.defender_mod >= 0 ? `+${a.defender_mod}` : `${a.defender_mod}`;
+        return `${a.name}: ${numFmt(a.men)} men, cohesion ${a.cohesion.toFixed(1)}\n` +
+          `   weaponry ${a.weaponry}, protection ${a.protection}, attack ${am}, defence ${dm}`;
+      }).join("\n\n");
+      return replyEmbed({ title: `Battle: ${battle}`, description: lines, color: CONFIG.embedColor }, true);
+    }
+
+    case "register_army": {
+      const battle = String(opt(interaction, "battle")).trim();
+      const armyName = String(opt(interaction, "army")).trim();
+      if (!(await getBattle(env, battle))) return reply(`There is no battle named ${battle}. Start it with /start_battle first.`, true);
+      if (!armyName) return reply("Give the army a name.", true);
+      if (await getArmy(env, battle, armyName)) return reply(`${battle} already has an army named ${armyName}. Use /edit_army to change it.`, true);
       const weaponry = Number(opt(interaction, "weaponry"));
-      const attackerMen = Number(opt(interaction, "attacker_men"));
-      const defenderMod = Number(opt(interaction, "defender_mod"));
       const protection = Number(opt(interaction, "protection"));
-      const cohesion = Number(opt(interaction, "cohesion"));
-      const defenderMen = Math.trunc(Number(opt(interaction, "defender_men")));
+      const attackerMod = Number(opt(interaction, "attacker_mod"));
+      const defenderMod = Number(opt(interaction, "defender_mod"));
+      const men = Math.trunc(Number(opt(interaction, "men")));
+      const cohOpt = opt(interaction, "cohesion");
+      const cohesion = cohOpt === undefined ? 100 : Number(cohOpt);
+      if (weaponry < 0 || protection < 0 || men < 0 || cohesion < 0 || cohesion > 100) {
+        return reply("Weaponry, protection, and men must be 0 or more, and cohesion must be between 0 and 100.", true);
+      }
+      await env.DB.prepare(
+        `INSERT INTO armies (battle, name, weaponry, protection, attacker_mod, defender_mod, men, cohesion)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(battle, armyName, weaponry, protection, attackerMod, defenderMod, men, cohesion).run();
+      return reply(`Registered ${armyName} in ${battle}: ${numFmt(men)} men, cohesion ${cohesion.toFixed(1)}.`, true);
+    }
 
-      // Roll a d100 for each side and apply their modifier.
-      const d100 = () => Math.floor(Math.random() * 100) + 1;
-      const attackerR = d100(), defenderR = d100();
-      const attackerTotal = attackerR + attackerMod;
-      const defenderTotal = defenderR + defenderMod;
+    case "edit_army": {
+      const battle = String(opt(interaction, "battle")).trim();
+      const armyName = String(opt(interaction, "army")).trim();
+      if (!(await getArmy(env, battle, armyName))) return reply(`There is no army named ${armyName} in ${battle}.`, true);
+      const cohV = opt(interaction, "cohesion");
+      if (cohV !== undefined && (Number(cohV) < 0 || Number(cohV) > 100)) return reply("Cohesion must be between 0 and 100.", true);
+      const menV = opt(interaction, "men");
+      if (menV !== undefined && Number(menV) < 0) return reply("Men must be 0 or more.", true);
 
-      const margin = attackerTotal - defenderTotal;
-      const multiplier = 1 + margin / 100;
-      // Bigger armies hit harder; 200 men is the baseline (1x). Rounded down.
-      const damage = Math.floor(weaponry * multiplier * (attackerMen / 200));
-      const newCohesion = Math.max(0, cohesion - damage);
-      const lossPercent = (cohesion - newCohesion) / 100;
-      const casualtyReduction = weaponry + protection > 0 ? protection / (weaponry + protection) : 0;
-      const casualties = Math.max(0, Math.round(defenderMen * lossPercent * (1 - casualtyReduction)));
-      const remaining = Math.max(0, defenderMen - casualties);
+      const updates: string[] = [];
+      const binds: unknown[] = [];
+      const maybe = (optName: string, col: string, int = false) => {
+        const v = opt(interaction, optName);
+        if (v !== undefined) {
+          updates.push(`${col} = ?`);
+          binds.push(int ? Math.trunc(Number(v)) : Number(v));
+        }
+      };
+      maybe("weaponry", "weaponry");
+      maybe("protection", "protection");
+      maybe("attacker_mod", "attacker_mod");
+      maybe("defender_mod", "defender_mod");
+      maybe("men", "men", true);
+      maybe("cohesion", "cohesion");
+      if (!updates.length) return reply("Give at least one stat to change.", true);
+      binds.push(battle, armyName);
+      await env.DB.prepare(`UPDATE armies SET ${updates.join(", ")} WHERE battle = ? AND name = ?`).bind(...binds).run();
+      const updated = (await getArmy(env, battle, armyName))!;
+      return reply(`Updated ${armyName} in ${battle}: ${numFmt(updated.men)} men, cohesion ${updated.cohesion.toFixed(1)}.`, true);
+    }
 
-      const num = (n: number) => n.toLocaleString("en-US");
-      const sign = (n: number) => (n >= 0 ? `+ ${n}` : `- ${Math.abs(n)}`);
-      const desc = [
-        `Attacker: ${attackerR} ${sign(attackerMod)} = ${attackerTotal}`,
-        `Defender: ${defenderR} ${sign(defenderMod)} = ${defenderTotal}`,
-        `Margin: ${margin}`,
-        `Effectiveness: ${multiplier.toFixed(2)}x`,
-        `Cohesion damage: ${damage}`,
-        `Cohesion: ${cohesion.toFixed(1)} to ${newCohesion.toFixed(1)}`,
-        `Cohesion lost: ${(lossPercent * 100).toFixed(1)}%`,
-        `Casualty reduction: ${(casualtyReduction * 100).toFixed(0)}%`,
-        `Casualties: ${num(casualties)}`,
-        `Remaining men: ${num(remaining)}`,
-      ].join("\n");
-      return replyEmbed({ title: "Attack result", description: desc, color: CONFIG.embedColor });
+    case "unregister_army": {
+      const battle = String(opt(interaction, "battle")).trim();
+      const armyName = String(opt(interaction, "army")).trim();
+      const res = await env.DB.prepare(`DELETE FROM armies WHERE battle = ? AND name = ?`).bind(battle, armyName).run();
+      if (!res.meta.changes) return reply(`There is no army named ${armyName} in ${battle}.`, true);
+      return reply(`Removed ${armyName} from ${battle}.`, true);
+    }
+
+    case "attack": {
+      const battle = String(opt(interaction, "battle")).trim();
+      const attackerName = String(opt(interaction, "attacker")).trim();
+      const defenderName = String(opt(interaction, "defender")).trim();
+      if (attackerName.toLowerCase() === defenderName.toLowerCase()) return reply("An army cannot attack itself.", true);
+      if (!(await getBattle(env, battle))) return reply(`There is no battle named ${battle}.`, true);
+      const atk = await getArmy(env, battle, attackerName);
+      if (!atk) return reply(`There is no army named ${attackerName} in ${battle}.`, true);
+      const def = await getArmy(env, battle, defenderName);
+      if (!def) return reply(`There is no army named ${defenderName} in ${battle}.`, true);
+
+      const r = computeAttack(atk, def);
+      const body = attackBody(atk, def, r);
+      const id = crypto.randomUUID();
+      const payload: PendingPayload = {
+        battle, attacker: atk.name, defender: def.name,
+        menBefore: r.menBefore, cohBefore: r.cohBefore, menAfter: r.menAfter, cohAfter: r.cohAfter, body,
+      };
+      await env.DB.prepare(
+        `INSERT INTO pending_attacks (id, battle, attacker, defender, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+      ).bind(id, battle, atk.name, def.name, JSON.stringify(payload), Date.now()).run();
+
+      return json({
+        type: 4,
+        data: {
+          flags: EPHEMERAL,
+          embeds: [{ title: "Attack preview", description: `${body}\n\nNothing has been applied yet.`, color: CONFIG.embedColor }],
+          components: [{
+            type: 1,
+            components: [
+              { type: 2, style: 3, label: "Confirm", custom_id: `atkok:${id}` },
+              { type: 2, style: 4, label: "Cancel", custom_id: `atkno:${id}` },
+            ],
+          }],
+        },
+      });
+    }
+
+    case "undo_attack": {
+      const last = await env.DB.prepare(`SELECT * FROM last_attack WHERE id = 1`)
+        .first<{ battle: string; defender: string; before_men: number; before_cohesion: number }>();
+      if (!last) return reply("There is no recent attack to undo.", true);
+      await env.DB.prepare(`DELETE FROM last_attack WHERE id = 1`).run();
+      const army = await getArmy(env, last.battle, last.defender);
+      if (!army) return reply("The army from the last attack no longer exists, so there is nothing to restore.", true);
+      await env.DB.prepare(`UPDATE armies SET men = ?, cohesion = ? WHERE battle = ? AND name = ?`)
+        .bind(last.before_men, last.before_cohesion, last.battle, last.defender).run();
+      return reply(
+        `Reverted the last attack. ${last.defender} in ${last.battle} is back to ` +
+          `${numFmt(last.before_men)} men, cohesion ${last.before_cohesion.toFixed(1)}.`,
+      );
     }
 
     case "announce": {
@@ -877,9 +1194,11 @@ async function handleModal(interaction: Interaction, env: Env): Promise<Response
   return reply("Unknown submission.", true);
 }
 
-async function handleComponent(interaction: Interaction): Promise<Response> {
+async function handleComponent(interaction: Interaction, env: Env): Promise<Response> {
   const cid = interaction.data.custom_id ?? "";
   if (cid === "reply" || cid.startsWith("reply:")) return openReplyModal(cid);
+  if (cid.startsWith("atkok:")) return confirmAttack(env, interaction, cid.slice(6));
+  if (cid.startsWith("atkno:")) return cancelAttack(env, interaction, cid.slice(6));
   return json({ type: 6 }); // acknowledge with no visible change
 }
 
@@ -894,17 +1213,60 @@ const COMMANDS = [
   { name: "help", description: "Show the list of commands and what they do." },
   { name: "time", description: "Show real-world clock status and countdown to the next automatic post." },
   {
-    name: "attack", description: "Work out cohesion damage and casualties from an attack.",
+    name: "start_battle", description: "Begin a new battle.",
+    options: [{ name: "name", description: "battle name", type: STRING, required: true }],
+  },
+  {
+    name: "end_battle", description: "End a battle and clear all its armies.",
+    options: [{ name: "name", description: "battle name", type: STRING, required: true, autocomplete: true }],
+  },
+  { name: "list_battles", description: "List all active battles." },
+  {
+    name: "battle_status", description: "Show every army in a battle and its current state.",
+    options: [{ name: "battle", description: "battle name", type: STRING, required: true, autocomplete: true }],
+  },
+  {
+    name: "register_army", description: "Add an army to a battle.",
     options: [
-      { name: "attacker_mod", description: "attacker roll modifier", type: NUMBER, required: true },
+      { name: "battle", description: "battle name", type: STRING, required: true, autocomplete: true },
+      { name: "army", description: "army name", type: STRING, required: true },
       { name: "weaponry", description: "weaponry", type: NUMBER, required: true },
-      { name: "attacker_men", description: "attacker men (200 = normal)", type: NUMBER, required: true },
-      { name: "defender_mod", description: "defender roll modifier", type: NUMBER, required: true },
       { name: "protection", description: "protection", type: NUMBER, required: true },
-      { name: "cohesion", description: "cohesion 0-100", type: NUMBER, required: true },
-      { name: "defender_men", description: "defender men", type: INTEGER, required: true },
+      { name: "attacker_mod", description: "attack roll modifier", type: NUMBER, required: true },
+      { name: "defender_mod", description: "defence roll modifier", type: NUMBER, required: true },
+      { name: "men", description: "number of men (also scales its own attacks, 200 = normal)", type: INTEGER, required: true },
+      { name: "cohesion", description: "starting cohesion 0-100 (default 100)", type: NUMBER, required: false },
     ],
   },
+  {
+    name: "edit_army", description: "Change an army's stats.",
+    options: [
+      { name: "battle", description: "battle name", type: STRING, required: true, autocomplete: true },
+      { name: "army", description: "army name", type: STRING, required: true, autocomplete: true },
+      { name: "weaponry", description: "weaponry", type: NUMBER, required: false },
+      { name: "protection", description: "protection", type: NUMBER, required: false },
+      { name: "attacker_mod", description: "attack roll modifier", type: NUMBER, required: false },
+      { name: "defender_mod", description: "defence roll modifier", type: NUMBER, required: false },
+      { name: "men", description: "number of men", type: INTEGER, required: false },
+      { name: "cohesion", description: "cohesion 0-100", type: NUMBER, required: false },
+    ],
+  },
+  {
+    name: "unregister_army", description: "Remove an army from a battle.",
+    options: [
+      { name: "battle", description: "battle name", type: STRING, required: true, autocomplete: true },
+      { name: "army", description: "army name", type: STRING, required: true, autocomplete: true },
+    ],
+  },
+  {
+    name: "attack", description: "Roll an attack between two armies (preview, then confirm).",
+    options: [
+      { name: "battle", description: "battle name", type: STRING, required: true, autocomplete: true },
+      { name: "attacker", description: "attacking army", type: STRING, required: true, autocomplete: true },
+      { name: "defender", description: "defending army", type: STRING, required: true, autocomplete: true },
+    ],
+  },
+  { name: "undo_attack", description: "Revert the most recent confirmed attack." },
   {
     name: "announce", description: "Schedule a bulletin announcement.",
     options: [
@@ -1017,7 +1379,12 @@ export default {
       return handleCommand(interaction, env);
     }
     if (interaction.type === 3) { // MESSAGE_COMPONENT (button press)
-      return handleComponent(interaction);
+      await ensureSchema(env);
+      return handleComponent(interaction, env);
+    }
+    if (interaction.type === 4) { // APPLICATION_COMMAND_AUTOCOMPLETE
+      await ensureSchema(env);
+      return handleAutocomplete(interaction, env);
     }
     if (interaction.type === 5) { // MODAL_SUBMIT
       await ensureSchema(env);
