@@ -600,27 +600,38 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
     }
 
     case "attack": {
-      const assault = Number(opt(interaction, "assault_roll"));
+      const attackerMod = Number(opt(interaction, "attacker_mod"));
       const weaponry = Number(opt(interaction, "weaponry"));
-      const deflection = Number(opt(interaction, "deflection_roll"));
+      const attackerMen = Number(opt(interaction, "attacker_men"));
+      const defenderMod = Number(opt(interaction, "defender_mod"));
       const protection = Number(opt(interaction, "protection"));
       const cohesion = Number(opt(interaction, "cohesion"));
-      const men = Math.trunc(Number(opt(interaction, "men")));
+      const defenderMen = Math.trunc(Number(opt(interaction, "defender_men")));
 
-      const margin = assault - deflection;
+      // Roll a d100 for each side and apply their modifier.
+      const d100 = () => Math.floor(Math.random() * 100) + 1;
+      const attackerR = d100(), defenderR = d100();
+      const attackerTotal = attackerR + attackerMod;
+      const defenderTotal = defenderR + defenderMod;
+
+      const margin = attackerTotal - defenderTotal;
       const multiplier = 1 + margin / 100;
-      const damage = weaponry * multiplier;
+      // Bigger armies hit harder; 200 men is the baseline (1x). Rounded down.
+      const damage = Math.floor(weaponry * multiplier * (attackerMen / 200));
       const newCohesion = Math.max(0, cohesion - damage);
       const lossPercent = (cohesion - newCohesion) / 100;
       const casualtyReduction = weaponry + protection > 0 ? protection / (weaponry + protection) : 0;
-      const casualties = Math.max(0, Math.round(men * lossPercent * (1 - casualtyReduction)));
-      const remaining = Math.max(0, men - casualties);
+      const casualties = Math.max(0, Math.round(defenderMen * lossPercent * (1 - casualtyReduction)));
+      const remaining = Math.max(0, defenderMen - casualties);
 
       const num = (n: number) => n.toLocaleString("en-US");
+      const sign = (n: number) => (n >= 0 ? `+ ${n}` : `- ${Math.abs(n)}`);
       const desc = [
-        `Margin: ${Math.round(margin)}`,
+        `Attacker: ${attackerR} ${sign(attackerMod)} = ${attackerTotal}`,
+        `Defender: ${defenderR} ${sign(defenderMod)} = ${defenderTotal}`,
+        `Margin: ${margin}`,
         `Effectiveness: ${multiplier.toFixed(2)}x`,
-        `Cohesion damage: ${damage.toFixed(1)}`,
+        `Cohesion damage: ${damage}`,
         `Cohesion: ${cohesion.toFixed(1)} to ${newCohesion.toFixed(1)}`,
         `Cohesion lost: ${(lossPercent * 100).toFixed(1)}%`,
         `Casualty reduction: ${(casualtyReduction * 100).toFixed(0)}%`,
@@ -885,12 +896,13 @@ const COMMANDS = [
   {
     name: "attack", description: "Work out cohesion damage and casualties from an attack.",
     options: [
-      { name: "assault_roll", description: "attacker roll", type: NUMBER, required: true },
+      { name: "attacker_mod", description: "attacker roll modifier", type: NUMBER, required: true },
       { name: "weaponry", description: "weaponry", type: NUMBER, required: true },
-      { name: "deflection_roll", description: "defender roll", type: NUMBER, required: true },
+      { name: "attacker_men", description: "attacker men (200 = normal)", type: NUMBER, required: true },
+      { name: "defender_mod", description: "defender roll modifier", type: NUMBER, required: true },
       { name: "protection", description: "protection", type: NUMBER, required: true },
       { name: "cohesion", description: "cohesion 0-100", type: NUMBER, required: true },
-      { name: "men", description: "men", type: INTEGER, required: true },
+      { name: "defender_men", description: "defender men", type: INTEGER, required: true },
     ],
   },
   {
