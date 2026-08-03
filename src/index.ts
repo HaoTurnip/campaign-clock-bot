@@ -804,7 +804,7 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
     }
 
     case "end_battle": {
-      const battleName = String(opt(interaction, "name")).trim();
+      const battleName = String(opt(interaction, "battle")).trim();
       if (!(await getBattle(env, battleName))) return reply(`There is no battle named ${battleName}.`, true);
       await env.DB.batch([
         env.DB.prepare(`DELETE FROM armies WHERE battle = ?`).bind(battleName),
@@ -1218,7 +1218,7 @@ const COMMANDS = [
   },
   {
     name: "end_battle", description: "End a battle and clear all its armies.",
-    options: [{ name: "name", description: "battle name", type: STRING, required: true, autocomplete: true }],
+    options: [{ name: "battle", description: "battle name", type: STRING, required: true, autocomplete: true }],
   },
   { name: "list_battles", description: "List all active battles." },
   {
