@@ -276,6 +276,16 @@ async function ensureSchema(env: Env): Promise<void> {
         before_cohesion REAL NOT NULL
       )`,
     ),
+    env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS counter_offers (
+        id TEXT PRIMARY KEY,
+        battle TEXT NOT NULL COLLATE NOCASE,
+        counter_attacker TEXT NOT NULL COLLATE NOCASE,
+        counter_target TEXT NOT NULL COLLATE NOCASE,
+        attacker_men INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+      )`,
+    ),
   ]);
 
   const d = CONFIG.defaults;
@@ -572,9 +582,9 @@ function computeAttack(atk: Army, def: Army): AttackResult {
   };
 }
 
-function attackBody(atk: Army, def: Army, r: AttackResult): string {
+function attackBody(atk: Army, def: Army, r: AttackResult, verb = "attacks"): string {
   return [
-    `${atk.name} attacks ${def.name}`,
+    `${atk.name} ${verb} ${def.name}`,
     `Attacker roll: ${r.aRoll} ${signFmt(atk.attacker_mod)} = ${r.aTotal}`,
     `Defender roll: ${r.dRoll} ${signFmt(def.defender_mod)} = ${r.dTotal}`,
     `Margin: ${r.margin}`,
@@ -590,6 +600,8 @@ function attackBody(atk: Army, def: Army, r: AttackResult): string {
 interface PendingPayload {
   battle: string; attacker: string; defender: string;
   menBefore: number; cohBefore: number; menAfter: number; cohAfter: number; body: string;
+  counter?: boolean; // this is itself a counterattack (gets no counter button)
+  offerId?: string; // the counter offer that spawned it, consumed on confirm
 }
 
 /** Edit the message a button is attached to (used to close out a preview). */
@@ -629,11 +641,26 @@ async function confirmAttack(env: Env, interaction: Interaction, id: string): Pr
   ]);
 
   if (interaction.channel_id) {
+    let components: unknown[] = [];
+    if (!p.counter) {
+      // Offer one counterattack: the defender strikes back using the men they had
+      // before this hit (the "old stats" rule).
+      const offerId = crypto.randomUUID();
+      await env.DB.prepare(
+        `INSERT INTO counter_offers (id, battle, counter_attacker, counter_target, attacker_men, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).bind(offerId, p.battle, p.defender, p.attacker, p.menBefore, Date.now()).run();
+      components = [{ type: 1, components: [{ type: 2, style: 2, label: "Counterattack", custom_id: `counter:${offerId}` }] }];
+    } else if (p.offerId) {
+      // A counterattack was just confirmed; consume its offer so it can't be reused.
+      await env.DB.prepare(`DELETE FROM counter_offers WHERE id = ?`).bind(p.offerId).run();
+    }
     await postMessage(env, interaction.channel_id, {
-      embeds: [{ title: `Attack in ${p.battle}`, description: p.body, color: CONFIG.embedColor }],
+      embeds: [{ title: `${p.counter ? "Counterattack" : "Attack"} in ${p.battle}`, description: p.body, color: CONFIG.embedColor }],
+      components,
     });
   }
-  return updateMessage("Attack confirmed and applied.");
+  return updateMessage(`${p.counter ? "Counterattack" : "Attack"} confirmed and applied.`);
 }
 
 async function cancelAttack(env: Env, interaction: Interaction, id: string): Promise<Response> {
@@ -643,6 +670,49 @@ async function cancelAttack(env: Env, interaction: Interaction, id: string): Pro
   }
   await env.DB.prepare(`DELETE FROM pending_attacks WHERE id = ?`).bind(id).run();
   return updateMessage("Attack cancelled. Nothing was changed.");
+}
+
+/** Begin a counterattack from the button on a confirmed attack: the old defender hits back at pre-hit strength. */
+async function startCounter(env: Env, interaction: Interaction, offerId: string): Promise<Response> {
+  const s = await loadState(env);
+  if (!(await isAuthorized(env, interaction, s.adminRoles))) {
+    return reply("You do not have permission to counterattack.", true);
+  }
+  const offer = await env.DB.prepare(`SELECT * FROM counter_offers WHERE id = ?`).bind(offerId)
+    .first<{ battle: string; counter_attacker: string; counter_target: string; attacker_men: number }>();
+  if (!offer) return reply("That counterattack is no longer available.", true);
+
+  const base = await getArmy(env, offer.battle, offer.counter_attacker);
+  const def = await getArmy(env, offer.battle, offer.counter_target);
+  if (!base || !def) return reply("One of the armies in this counterattack no longer exists.", true);
+
+  const atk: Army = { ...base, men: offer.attacker_men }; // fight at the strength held before being hit
+  const r = computeAttack(atk, def);
+  const body = attackBody(atk, def, r, "counterattacks");
+  const id = crypto.randomUUID();
+  const payload: PendingPayload = {
+    battle: offer.battle, attacker: atk.name, defender: def.name,
+    menBefore: r.menBefore, cohBefore: r.cohBefore, menAfter: r.menAfter, cohAfter: r.cohAfter,
+    body, counter: true, offerId,
+  };
+  await env.DB.prepare(
+    `INSERT INTO pending_attacks (id, battle, attacker, defender, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+  ).bind(id, offer.battle, atk.name, def.name, JSON.stringify(payload), Date.now()).run();
+
+  return json({
+    type: 4,
+    data: {
+      flags: EPHEMERAL,
+      embeds: [{ title: "Counterattack preview", description: `${body}\n\nNothing has been applied yet.`, color: CONFIG.embedColor }],
+      components: [{
+        type: 1,
+        components: [
+          { type: 2, style: 3, label: "Confirm", custom_id: `atkok:${id}` },
+          { type: 2, style: 4, label: "Cancel", custom_id: `atkno:${id}` },
+        ],
+      }],
+    },
+  });
 }
 
 /** Autocomplete battle and army names as the GM types. */
@@ -752,7 +822,7 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
               "/unregister_army <battle> <army> - remove an army",
               "/battle_status <battle> - list armies and their current state",
               "/list_battles - list active battles",
-              "/attack <battle> <attacker> <defender> - roll an attack, then confirm",
+              "/attack <battle> <attacker> <defender> - roll an attack, then confirm (a confirmed attack can be countered)",
               "/undo_attack - revert the last confirmed attack",
               "/end_battle <name> - end a battle and clear its armies",
             ]),
@@ -809,6 +879,7 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
       await env.DB.batch([
         env.DB.prepare(`DELETE FROM armies WHERE battle = ?`).bind(battleName),
         env.DB.prepare(`DELETE FROM pending_attacks WHERE battle = ?`).bind(battleName),
+        env.DB.prepare(`DELETE FROM counter_offers WHERE battle = ?`).bind(battleName),
         env.DB.prepare(`DELETE FROM last_attack WHERE battle = ?`).bind(battleName),
         env.DB.prepare(`DELETE FROM battles WHERE name = ?`).bind(battleName),
       ]);
@@ -1199,6 +1270,7 @@ async function handleComponent(interaction: Interaction, env: Env): Promise<Resp
   if (cid === "reply" || cid.startsWith("reply:")) return openReplyModal(cid);
   if (cid.startsWith("atkok:")) return confirmAttack(env, interaction, cid.slice(6));
   if (cid.startsWith("atkno:")) return cancelAttack(env, interaction, cid.slice(6));
+  if (cid.startsWith("counter:")) return startCounter(env, interaction, cid.slice(8));
   return json({ type: 6 }); // acknowledge with no visible change
 }
 
