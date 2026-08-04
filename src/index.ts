@@ -286,6 +286,13 @@ async function ensureSchema(env: Env): Promise<void> {
         created_at INTEGER NOT NULL
       )`,
     ),
+    env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS dug_in (
+        battle TEXT NOT NULL COLLATE NOCASE,
+        army TEXT NOT NULL COLLATE NOCASE,
+        PRIMARY KEY (battle, army)
+      )`,
+    ),
   ]);
 
   const d = CONFIG.defaults;
@@ -820,6 +827,7 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
               "/register_army <battle> <army> <stats> - add an army",
               "/edit_army <battle> <army> [stats] - change an army's stats",
               "/unregister_army <battle> <army> - remove an army",
+              "/dig-army <battle> <army> - toggle digging in (+40 defence)",
               "/battle_status <battle> - list armies and their current state",
               "/list_battles - list active battles",
               "/attack <battle> <attacker> <defender> - roll an attack, then confirm (a confirmed attack can be countered)",
@@ -880,6 +888,7 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
         env.DB.prepare(`DELETE FROM armies WHERE battle = ?`).bind(battleName),
         env.DB.prepare(`DELETE FROM pending_attacks WHERE battle = ?`).bind(battleName),
         env.DB.prepare(`DELETE FROM counter_offers WHERE battle = ?`).bind(battleName),
+        env.DB.prepare(`DELETE FROM dug_in WHERE battle = ?`).bind(battleName),
         env.DB.prepare(`DELETE FROM last_attack WHERE battle = ?`).bind(battleName),
         env.DB.prepare(`DELETE FROM battles WHERE name = ?`).bind(battleName),
       ]);
@@ -905,10 +914,13 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
       if (!results.length) {
         return replyEmbed({ title: `Battle: ${battle}`, description: "No armies registered yet.", color: CONFIG.embedColor }, true);
       }
+      const dug = (await env.DB.prepare(`SELECT army FROM dug_in WHERE battle = ?`).bind(battle).all<{ army: string }>()).results;
+      const dugSet = new Set(dug.map((r) => r.army.toLowerCase()));
       const lines = results.map((a) => {
         const am = a.attacker_mod >= 0 ? `+${a.attacker_mod}` : `${a.attacker_mod}`;
         const dm = a.defender_mod >= 0 ? `+${a.defender_mod}` : `${a.defender_mod}`;
-        return `${a.name}: ${numFmt(a.men)} men, cohesion ${a.cohesion.toFixed(1)}\n` +
+        const tag = dugSet.has(a.name.toLowerCase()) ? " (dug in)" : "";
+        return `${a.name}${tag}: ${numFmt(a.men)} men, cohesion ${a.cohesion.toFixed(1)}\n` +
           `   weaponry ${a.weaponry}, protection ${a.protection}, attack ${am}, defence ${dm}`;
       }).join("\n\n");
       return replyEmbed({ title: `Battle: ${battle}`, description: lines, color: CONFIG.embedColor }, true);
@@ -973,7 +985,29 @@ async function handleCommand(interaction: Interaction, env: Env): Promise<Respon
       const armyName = String(opt(interaction, "army")).trim();
       const res = await env.DB.prepare(`DELETE FROM armies WHERE battle = ? AND name = ?`).bind(battle, armyName).run();
       if (!res.meta.changes) return reply(`There is no army named ${armyName} in ${battle}.`, true);
+      await env.DB.prepare(`DELETE FROM dug_in WHERE battle = ? AND army = ?`).bind(battle, armyName).run();
       return reply(`Removed ${armyName} from ${battle}.`, true);
+    }
+
+    case "dig-army": {
+      const battle = String(opt(interaction, "battle")).trim();
+      const armyName = String(opt(interaction, "army")).trim();
+      const army = await getArmy(env, battle, armyName);
+      if (!army) return reply(`There is no army named ${armyName} in ${battle}.`, true);
+      const dug = await env.DB.prepare(`SELECT 1 FROM dug_in WHERE battle = ? AND army = ?`).bind(army.battle, army.name).first();
+      const newMod = army.defender_mod + (dug ? -40 : 40);
+      await env.DB.batch([
+        env.DB.prepare(`UPDATE armies SET defender_mod = ? WHERE battle = ? AND name = ?`).bind(newMod, army.battle, army.name),
+        dug
+          ? env.DB.prepare(`DELETE FROM dug_in WHERE battle = ? AND army = ?`).bind(army.battle, army.name)
+          : env.DB.prepare(`INSERT INTO dug_in (battle, army) VALUES (?, ?)`).bind(army.battle, army.name),
+      ]);
+      const modStr = newMod >= 0 ? `+${newMod}` : `${newMod}`;
+      return reply(
+        dug
+          ? `${army.name} in ${army.battle} is no longer dug in. Defence modifier is now ${modStr}.`
+          : `${army.name} in ${army.battle} has dug in. Defence modifier increased by 40 to ${modStr}.`,
+      );
     }
 
     case "attack": {
@@ -1325,6 +1359,13 @@ const COMMANDS = [
   },
   {
     name: "unregister_army", description: "Remove an army from a battle.",
+    options: [
+      { name: "battle", description: "battle name", type: STRING, required: true, autocomplete: true },
+      { name: "army", description: "army name", type: STRING, required: true, autocomplete: true },
+    ],
+  },
+  {
+    name: "dig-army", description: "Toggle an army digging in (+40 defence, run again to undo).",
     options: [
       { name: "battle", description: "battle name", type: STRING, required: true, autocomplete: true },
       { name: "army", description: "army name", type: STRING, required: true, autocomplete: true },
